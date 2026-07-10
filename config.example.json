@@ -1,0 +1,16 @@
+{
+  "workspace": "my-team",
+  "workspaceSecret": "shared-secret-passphrase",
+  "agentId": "",
+  "peerName": "my-agent-name",
+  "role": "what this agent does (optional)",
+  "listenPort": 0,
+
+  "_a2a_comment": "以下均为可选字段，省略即用默认值。A2A JSON-RPC over HTTP；共享密钥作 Bearer。",
+  "agentCardPath": "/.well-known/agent-card.json",
+  "rpcPath": "/rpc",
+  "notifyPath": "/a2a/notify",
+  "pushSweepMs": 15000,
+  "pushBackstopMs": 30000,
+  "autoInjectMessage": false
+}

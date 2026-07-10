@@ -1,0 +1,15 @@
+# dependencies
+node_modules/
+
+# pi-a2a local config & data (contains workspaceSecret — do NOT commit)
+.pi/
+
+# local db
+*.db.json
+
+# logs & temp
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
