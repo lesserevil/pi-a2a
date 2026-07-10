@@ -10,7 +10,7 @@
  * 异步: 对方离线 → 本地 outbox 暂存；对方上线自动重投（无需同时在线）
  *
  * Tools:    a2a_send, a2a_inbox, a2a_read, a2a_reply, a2a_peers
- * Commands: /a2a-setup, /a2a
+ * Commands: /a2a-setup, /a2a, /a2a-clear, /a2a-send
  * Widget:   本地未读数 + 在线 peer（事件驱动刷新 + 低频兜底）
  */
 
@@ -719,6 +719,82 @@ export default function (pi: ExtensionAPI) {
       state.store.persist();
       recalcUnread();
       ctx.ui.notify(`🗑️ 已清空收件箱，删除 ${removed} 条消息`, "info");
+    },
+  });
+
+  // ── Command: /a2a-send ────────────────────────────────────
+  pi.registerCommand("a2a-send", {
+    description: "直接给其他 agent 发消息（不经过 AI）。用法: /a2a-send <peer> <消息> 或 /a2a-send 交互式",
+    handler: async (args, ctx) => {
+      if (!state.config || !state.store || !state.net) {
+        ctx.ui.notify(notReady(), "warning");
+        return;
+      }
+      const cfg = state.config;
+      let to: string;
+      let body: string;
+      let subject = "";
+
+      const trimmed = (args ?? "").trim();
+      if (trimmed) {
+        // /a2a-send <peer> <body...>  —— 第一个空格前是 peer，其后全部是消息内容
+        const sp = trimmed.indexOf(" ");
+        if (sp === -1) {
+          ctx.ui.notify("用法: /a2a-send <peer> <消息内容>（peer 后空格接内容）", "warning");
+          return;
+        }
+        to = trimmed.slice(0, sp).replace(/^@/, "");
+        body = trimmed.slice(sp + 1).trim();
+      } else {
+        // 无参数 → 交互式选 peer + 输入主题/内容
+        if (!ctx.hasUI) {
+          ctx.ui.notify("a2a-send 交互式需在 TUI 中运行，或用 /a2a-send <peer> <消息>", "warning");
+          return;
+        }
+        const peers = state.net.getOnlinePeers().filter((p) => p.peerName !== cfg.peerName);
+        if (peers.length === 0) {
+          ctx.ui.notify("🤷 当前没有在线 agent（可 /a2a 查看）", "warning");
+          return;
+        }
+        const picked = await ctx.ui.select("发给谁？", peers.map((p) => p.peerName));
+        if (!picked) {
+          ctx.ui.notify("已取消", "info");
+          return;
+        }
+        to = picked;
+        subject = (await ctx.ui.input("主题（可选，回车跳过）", ""))?.trim() || "";
+        body = (await ctx.ui.input("消息内容", ""))?.trim() || "";
+      }
+
+      if (!body) {
+        ctx.ui.notify("消息内容为空，已取消", "warning");
+        return;
+      }
+
+      const id = genMsgId();
+      const msg: Message = {
+        id,
+        thread_id: id,
+        reply_to: null,
+        from_id: cfg.agentId,
+        from_name: cfg.peerName,
+        to_name: to,
+        subject,
+        body,
+        kind: "message",
+        direction: "sent",
+        created_at: nowSec(),
+      };
+      state.store.addMessage(msg);
+      state.store.persist();
+      const result = await state.net.deliver(msg);
+      state.store.persist();
+
+      let text = `✅ 已发送给 ${to === "*" ? "所有人" : to}`;
+      if (result.delivered.length) text += "（已送达）";
+      else if (result.queued.length) text += "（⏳ 对方离线，进发件箱，上线自动送达）";
+      else if (result.failed.length) text += "（⚠️ 未送达）";
+      ctx.ui.notify(text, "info");
     },
   });
 }
