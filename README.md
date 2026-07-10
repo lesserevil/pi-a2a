@@ -111,10 +111,32 @@ Tool signatures are unchanged from the previous (server-backed) version — only
 
 ## Commands
 
+Slash commands let you use pi-a2a **without involving the AI** — they run directly and show results as a notification.
+
 | Command | Description |
 |---------|-------------|
-| `/a2a-setup` | Interactive setup wizard |
-| `/a2a` | Show status (inbox + online agents) |
+| `/a2a-setup` | Interactive setup wizard (workspace, secret, name, role) |
+| `/a2a` | Show status (unread count + online agents) |
+| `/a2a-peers` | List online agents and their roles |
+| `/a2a-inbox` | List recent inbox messages (● unread / ○ read) |
+| `/a2a-send` | Send a message to another agent directly |
+| `/a2a-clear` | Clear inbox (archives & sent history kept) |
+
+### Usage examples
+
+```
+/a2a                          # status: unread count + who's online
+/a2a-peers                    # who's online right now
+/a2a-peers all                # include offline (previously seen) agents
+/a2a-inbox                    # recent 20 messages (● unread, ○ read)
+/a2a-inbox unread             # only unread
+/a2a-inbox msg_xxxxx          # read full message + mark as read
+/a2a-send frontend 你好       # quick message to @frontend
+/a2a-send                     # interactive: pick peer → subject → body
+/a2a-clear                    # clear inbox (archives & sent history kept)
+```
+
+> For threaded replies and delegations (`kind=request`), use the AI tools (`a2a_reply`, `a2a_send` with `kind`) — they handle thread tracking and result push-back automatically.
 
 ## Widget
 

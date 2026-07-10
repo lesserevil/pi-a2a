@@ -1,6 +1,6 @@
 {
   "name": "pi-a2a",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Agent-to-agent message bus for pi — decentralized LAN P2P, agents discover each other via mDNS and talk point-to-point, no server required",
   "keywords": [
     "pi-package",

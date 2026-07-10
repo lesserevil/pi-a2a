@@ -10,7 +10,7 @@
  * 异步: 对方离线 → 本地 outbox 暂存；对方上线自动重投（无需同时在线）
  *
  * Tools:    a2a_send, a2a_inbox, a2a_read, a2a_reply, a2a_peers
- * Commands: /a2a-setup, /a2a, /a2a-clear, /a2a-send
+ * Commands: /a2a-setup, /a2a, /a2a-clear, /a2a-send, /a2a-inbox, /a2a-peers
  * Widget:   本地未读数 + 在线 peer（事件驱动刷新 + 低频兜底）
  */
 
@@ -795,6 +795,82 @@ export default function (pi: ExtensionAPI) {
       else if (result.queued.length) text += "（⏳ 对方离线，进发件箱，上线自动送达）";
       else if (result.failed.length) text += "（⚠️ 未送达）";
       ctx.ui.notify(text, "info");
+    },
+  });
+
+  // ── Command: /a2a-inbox ───────────────────────────────────
+  pi.registerCommand("a2a-inbox", {
+    description: "查看收件箱（不经过 AI）。用法: /a2a-inbox [unread|<msg_id>]",
+    handler: async (args, ctx) => {
+      if (!state.config || !state.store) {
+        ctx.ui.notify(NO_CONFIG_MSG, "warning");
+        return;
+      }
+      const me = state.config.peerName;
+      const trimmed = (args ?? "").trim();
+
+      // /a2a-inbox <msg_id>  → 读取完整消息 + 标记已读
+      if (trimmed && trimmed !== "unread" && trimmed !== "未读") {
+        const threadMsgs = state.store.getThreadDeep(trimmed);
+        if (threadMsgs.length === 0) {
+          ctx.ui.notify(`未找到消息 ${trimmed}`, "warning");
+          return;
+        }
+        const lines = threadMsgs.map((m) => {
+          const t = new Date(m.created_at * 1000).toLocaleTimeString();
+          return `[${t}] ${m.from_name} → ${m.to_name}${m.subject ? ` 「${m.subject}」` : ""}\n${m.body}`;
+        });
+        state.store.markThreadRead(threadMsgs[0].thread_id, me);
+        state.store.persist();
+        recalcUnread();
+        ctx.ui.notify(lines.join("\n\n---\n\n"), "info");
+        return;
+      }
+
+      // /a2a-inbox [unread]  → 列表
+      const unreadOnly = trimmed === "unread" || trimmed === "未读";
+      const msgs = state.store.getInbox(me, { unread: unreadOnly, limit: 20 });
+      if (msgs.length === 0) {
+        ctx.ui.notify(unreadOnly ? "📭 没有未读消息" : "📭 收件箱为空", "info");
+        return;
+      }
+      const totalUnread = state.store.unreadCount(me);
+      const lines = msgs.map((m) => {
+        const tag = state.store!.isRead(m.id, me) ? "○" : "●";
+        const subj = m.subject ? `「${m.subject}」` : "「(无主题)」";
+        const preview = m.body.replace(/\s+/g, " ").slice(0, 60);
+        return `${tag} [${m.id}] ${m.from_name} → ${subj} ${preview}`;
+      });
+      const header = `📨 收件箱 (${msgs.length}${unreadOnly ? " 未读" : ""} · 共 ${totalUnread} 未读)`;
+      ctx.ui.notify(`${header}\n` + lines.join("\n"), "info");
+    },
+  });
+
+  // ── Command: /a2a-peers ───────────────────────────────────
+  pi.registerCommand("a2a-peers", {
+    description: "查看在线 agent（不经过 AI）。用法: /a2a-peers [all]",
+    handler: async (args, ctx) => {
+      if (!state.config || !state.net) {
+        ctx.ui.notify(NO_CONFIG_MSG, "warning");
+        return;
+      }
+      const me = state.config.peerName;
+      const includeAll = (args ?? "").trim() === "all" || (args ?? "").trim() === "全部";
+      const peers = includeAll ? state.net.getPeers() : state.net.getOnlinePeers();
+      const others = peers.filter((p) => p.peerName !== me);
+      if (others.length === 0) {
+        ctx.ui.notify(`🤷 当前${includeAll ? "已知" : "在线"}没有其他 agent`, "info");
+        return;
+      }
+      const lines = others.map((p) => {
+        const status = includeAll && !state.net!.isOnline(p.peerName) ? "⚪" : "🟢";
+        return `${status} ${p.peerName}${p.role ? ` — ${p.role}` : ""}`;
+      });
+      const onlineCount = others.filter((p) => state.net!.isOnline(p.peerName)).length;
+      const header = includeAll
+        ? `👥 Agents (${onlineCount} 在线 / ${others.length} 已知)`
+        : `👥 在线 Agents (${others.length})`;
+      ctx.ui.notify(`${header}\n` + lines.join("\n"), "info");
     },
   });
 }
