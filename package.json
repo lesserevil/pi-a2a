@@ -1,6 +1,6 @@
 {
   "name": "pi-a2a",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Agent-to-agent message bus for pi — decentralized LAN P2P, agents discover each other via mDNS and talk point-to-point, no server required",
   "keywords": [
     "pi-package",
@@ -19,6 +19,14 @@
   ],
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/imkingjh999/pi-a2a.git"
+  },
+  "homepage": "https://github.com/imkingjh999/pi-a2a#readme",
+  "bugs": {
+    "url": "https://github.com/imkingjh999/pi-a2a/issues"
+  },
   "scripts": {
     "typecheck": "bash scripts/typecheck.sh",
     "test:e2e": "bash scripts/run-e2e.sh"
