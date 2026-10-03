@@ -18,6 +18,8 @@
  *     "pushSweepMs": 15000,               // push 兜底扫描间隔
  *     "pushBackstopMs": 30000,            // 超过此时长未收 push 则主动 GetTask
  *     "autoInjectMessage": false         // 普通消息是否也自动注入会话（默认 false=只通知）
+ *     "fileRoot": "~/.pi/a2a-files",    // 可选，文件传输沙箱根目录（a2a_put/get 只能读写其下）
+ *     "fileMaxBytes": 67108864            // 可选，单次文件传输上限（默认 64 MiB）
  *   }
  *
  * 配置优先级：项目级 (.pi/pi-a2a.json) > 全局 (~/.pi/agent/pi-a2a.json)
@@ -43,6 +45,8 @@ export interface A2aConfig {
   pushSweepMs?: number; // 默认 15000
   pushBackstopMs?: number; // 默认 30000
   autoInjectMessage?: boolean; // 默认 false：普通 message 只通知；true 时也注入会话
+  fileRoot?: string; // 可选，文件传输的沙箱根目录（默认 ~/.pi/a2a-files）；a2a_put/get 只能读写其下
+  fileMaxBytes?: number; // 可选，单次传输上限（默认 64 MiB）
 }
 
 // 占位符：表示 agentId 尚未真正生成（如 config.example.json 里的空串）

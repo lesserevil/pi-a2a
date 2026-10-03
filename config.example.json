@@ -15,5 +15,7 @@
   "notifyPath": "/a2a/notify",
   "pushSweepMs": 15000,
   "pushBackstopMs": 30000,
-  "autoInjectMessage": false
+  "autoInjectMessage": false,
+  "fileRoot": "~/.pi/a2a-files",
+  "fileMaxBytes": 67108864
 }

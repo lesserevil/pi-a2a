@@ -27,6 +27,7 @@ import {
 } from "./config.ts";
 import { Store, type Message, type MsgKind } from "./store.ts";
 import { Network, type Peer } from "./net.ts";
+import { resolveFileRoot } from "./files.ts";
 
 // ── 状态 ────────────────────────────────────────────────────
 
@@ -598,6 +599,93 @@ export default function (pi: ExtensionAPI) {
       } catch (e) {
         return textResult(`⚠️ 无法读取会话: ${e instanceof Error ? e.message : String(e)}`);
       }
+    },
+  });
+
+  // ── Tool: a2a_put ─────────────────────────────────────────
+  pi.registerTool({
+    name: "a2a_put",
+    label: "A2A Put File",
+    description:
+      "Copy a local file to another agent's file sandbox over the a2a channel (peer-to-peer HTTP, bytes do not go through the model). Paths are relative to each side's file root; use a2a_file_root to see it.",
+    promptSnippet: "Send a file to another agent",
+    promptGuidelines: [
+      "Use a2a_put to hand a file to another host; both paths are relative to the a2a file root, not arbitrary filesystem paths.",
+      "Use a2a_file_root to discover the local root if unsure.",
+      "For text/config snippets under ~300KB, an exec: request with base64 also works, but a2a_put is cheaper and handles large/binary files.",
+    ],
+    parameters: Type.Object({
+      to: Type.String({ description: "Recipient agent peer_name" }),
+      path: Type.String({ description: "Source path relative to the local file root" }),
+      remotePath: Type.Optional(
+        Type.String({ description: "Destination path relative to the peer's file root (default: same as path)" }),
+      ),
+      overwrite: Type.Optional(Type.Boolean({ description: "Overwrite if it exists on the peer (default false)" })),
+    }),
+    async execute(_id, params) {
+      if (!state.config || !state.net) return textResult(notReady());
+      try {
+        const res = await state.net.putFile(
+          params.to,
+          params.path,
+          params.remotePath ?? params.path,
+          params.overwrite === true,
+        );
+        return textResult(`✅ 已发送 ${params.to}:\n  path: ${res.path}\n  bytes: ${res.bytes}\n  sha256: ${res.sha256}`);
+      } catch (e) {
+        return textResult(`⚠️ a2a_put 失败: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    },
+  });
+
+  // ── Tool: a2a_get ─────────────────────────────────────────
+  pi.registerTool({
+    name: "a2a_get",
+    label: "A2A Get File",
+    description:
+      "Fetch a file from another agent's file sandbox into the local one over the a2a channel (peer-to-peer HTTP, bytes do not go through the model). Paths are relative to each side's file root.",
+    promptSnippet: "Fetch a file from another agent",
+    promptGuidelines: [
+      "Use a2a_get to pull a file from another host; both paths are relative to the a2a file root.",
+      "The transferred file lands inside the local file root, never outside it.",
+    ],
+    parameters: Type.Object({
+      from: Type.String({ description: "Source agent peer_name" }),
+      path: Type.String({ description: "Path relative to the peer's file root" }),
+      localPath: Type.Optional(
+        Type.String({ description: "Destination path relative to the local file root (default: same as path)" }),
+      ),
+      overwrite: Type.Optional(Type.Boolean({ description: "Overwrite if it exists locally (default false)" })),
+    }),
+    async execute(_id, params) {
+      if (!state.config || !state.net) return textResult(notReady());
+      try {
+        const res = await state.net.getFile(
+          params.from,
+          params.path,
+          params.localPath ?? params.path,
+          params.overwrite === true,
+        );
+        return textResult(`✅ 已从 ${params.from} 取回:\n  path: ${res.path}\n  bytes: ${res.bytes}\n  sha256: ${res.sha256}`);
+      } catch (e) {
+        return textResult(`⚠️ a2a_get 失败: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    },
+  });
+
+  // ── Tool: a2a_file_root ───────────────────────────────────
+  pi.registerTool({
+    name: "a2a_file_root",
+    label: "A2A File Root",
+    description:
+      "Report the local sandbox directory used by a2a_put / a2a_get. All file transfers are confined to this directory on each host.",
+    promptSnippet: "Show the local a2a file sandbox root",
+    promptGuidelines: ["Use a2a_file_root to learn where a2a_put/a2a_get place files locally."],
+    parameters: Type.Object({}),
+    async execute() {
+      if (!state.config) return textResult(notReady());
+      const root = resolveFileRoot((state.config as any).fileRoot);
+      return textResult(`📁 a2a file root: ${root}\n（a2a_put / a2a_get 的所有路径都相对于此目录）`);
     },
   });
 

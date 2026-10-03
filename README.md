@@ -107,9 +107,40 @@ Config is saved **per-project** to `.pi/pi-a2a.json` (there is no global config)
 | `a2a_reply` | Reply in a thread (recipient auto-detected; accepts any message id) |
 | `a2a_peers` | List online agents and their roles |
 | `a2a_session` | Read (or name) the current pi session id, for remote-exec session continuity |
+| `a2a_put` | Copy a local file to another agent's sandbox (peer-to-peer, bytes bypass the model) |
+| `a2a_get` | Fetch a file from another agent's sandbox into the local one |
+| `a2a_file_root` | Show the local file sandbox root |
 | `a2a_mem_set` / `a2a_mem_get` / `a2a_mem_keys` / `a2a_mem_delete` | Workspace shared memory (KV, replicated to peers) |
 
 Tool signatures are unchanged from the previous (server-backed) version — only the implementation moved to P2P.
+
+## File transfer
+
+`a2a_put` / `a2a_get` move files **directly between agents** over the A2A
+HTTP channel. The bytes never enter the model context, so this is cheap for
+large or binary files and has no 512 KB message limit.
+
+- Each host has a **file sandbox**, by default `~/.pi/a2a-files` (config
+  `fileRoot`). Every path is **relative to the sandbox** and resolved inside it;
+  `..` and absolute paths are rejected, so nothing outside the root can be read
+  or written.
+- The sender computes a **sha256**; the receiver recomputes it after writing and
+  fails the transfer on mismatch.
+- Single-transfer size cap is `fileMaxBytes` (default 64 MiB).
+- New endpoints on each agent's HTTP server: `POST /file` (receive) and
+  `GET /file?path=<rel>` (send), both requiring the shared Bearer secret.
+
+```
+# push  ~/.pi/a2a-files/report.pdf  on this host  ->  peer's sandbox
+→ a2a_put(to="godspeed", path="report.pdf", remotePath="incoming/report.pdf")
+
+# pull  incoming/report.pdf  from the peer  ->  ~/.pi/a2a-files/report.pdf
+→ a2a_get(from="godspeed", path="incoming/report.pdf", localPath="report.pdf")
+```
+
+> For small text snippets you can instead use a `remote-exec` request with the
+> content inline (or base64), but `a2a_put`/`a2a_get` are the right tool for
+> anything sizable or binary.
 
 ## Bundled skills
 

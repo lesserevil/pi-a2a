@@ -9,10 +9,14 @@
  *     GET  /health                        — mDNS 续命探测（非 spec，无害）
  *     POST /rpc                           — JSON-RPC: SendMessage / GetTask
  *     POST /a2a/notify                    — push-notification webhook 接收
+ *     POST /file                          — 收文件（body=原始字节，元数据在 query）
+ *     GET  /file?path=<rel>               — 发文件（响应体=原始字节）
  *   Client (fetch):
  *     send(peer, msg)     — SendMessage（request 时附 pushNotificationConfig）
  *     getTask(peer, id)   — GetTask（push 兜底）
  *     notifyPeer(url, t)  — 完成入站 task 时把结果 push 给请求方
+ *     putFile(peer, ...)  — 推送本地沙箱文件到 peer
+ *     getFile(peer, ...)  — 从 peer 拉取文件到本地沙箱
  *
  * 发现: mDNS/Bonjour 广告 + 浏览 _pi-a2a._tcp（TXT proto=a2a）+ 同机 presence 兜底。
  * 鉴权: 共享 workspaceSecret 作 Bearer token（每个 JSON-RPC 请求校验）。
@@ -26,6 +30,12 @@ import * as crypto from "node:crypto";
 import { createRequire } from "node:module";
 import type { A2aConfig } from "./config.ts";
 import { Store, type Message, type MemEntry } from "./store.ts";
+import {
+  resolveFileRoot,
+  writeReceivedFile,
+  readOutgoingFile,
+  DEFAULT_FILE_MAX_BYTES,
+} from "./files.ts";
 
 const nativeRequire = createRequire(import.meta.url);
 
@@ -214,6 +224,16 @@ export class Network {
   private get agentCardPath(): string {
     return this.config.agentCardPath ?? "/.well-known/agent-card.json";
   }
+  private get filePath(): string {
+    return (this.config as any).filePath ?? "/file";
+  }
+  private fileRoot(): string {
+    return resolveFileRoot((this.config as any).fileRoot);
+  }
+  private fileMaxBytes(): number {
+    const n = Number((this.config as any).fileMaxBytes);
+    return Number.isFinite(n) && n > 0 ? n : DEFAULT_FILE_MAX_BYTES;
+  }
   private nextReqId(): number {
     return ++this.reqIdCounter;
   }
@@ -332,6 +352,11 @@ export class Network {
       // push-notification webhook 接收
       if (req.method === "POST" && url === this.notifyPath) {
         return this.handleNotify(req, res);
+      }
+      // 文件传输：按路径分发（带 query）
+      if (url === this.filePath || url.startsWith(this.filePath + "?")) {
+        if (req.method === "POST") return this.handleFileReceive(req, res);
+        if (req.method === "GET") return this.handleFileSend(req, res);
       }
       this.json(res, 404, { error: "Not found" });
     } catch (e) {
@@ -1083,6 +1108,141 @@ export class Network {
         /* 单 peer 投递失败不影响其他 peer；对方上线后 snapshot 治愈 */
       });
     }
+  }
+
+  // ── 文件传输 ──────────────────────────────────────────
+  /** POST /file?path=<rel>&sha256=<hex>&overwrite=1  + 原始字节 body */
+  private async handleFileReceive(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    if (!this.checkAuth(req)) return this.json(res, 401, { error: "unauthorized" });
+    const q = this.queryOf(req);
+    const rel = q.get("path") ?? "";
+    const wantSha = q.get("sha256") ?? undefined;
+    const overwrite = q.get("overwrite") === "1" || q.get("overwrite") === "true";
+    let data: Buffer;
+    try {
+      data = await this.readRawBody(req, this.fileMaxBytes());
+    } catch (e) {
+      return this.json(res, 413, { error: e instanceof Error ? e.message : "read failed" });
+    }
+    try {
+      const got = writeReceivedFile(this.fileRoot(), rel, data, wantSha, overwrite);
+      this.hooks.log?.(`file 收到: ${got.rel} (${got.bytes} bytes)`);
+      return this.json(res, 200, {
+        ok: true,
+        path: got.rel,
+        bytes: got.bytes,
+        sha256: got.sha256,
+        root: this.fileRoot(),
+      });
+    } catch (e) {
+      return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  /** GET /file?path=<rel>  → 响应体 = 原始字节，头部带 sha256/字节数 */
+  private handleFileSend(req: http.IncomingMessage, res: http.ServerResponse): void {
+    if (!this.checkAuth(req)) return this.json(res, 401, { error: "unauthorized" });
+    const q = this.queryOf(req);
+    const rel = q.get("path") ?? "";
+    let out;
+    try {
+      out = readOutgoingFile(this.fileRoot(), rel);
+    } catch (e) {
+      return this.json(res, 404, { error: e instanceof Error ? e.message : String(e) });
+    }
+    if (out.bytes > this.fileMaxBytes()) {
+      return this.json(res, 413, { error: `file exceeds fileMaxBytes (${out.bytes})` });
+    }
+    this.hooks.log?.(`file 发出: ${out.rel} (${out.bytes} bytes)`);
+    res.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": String(out.bytes),
+      "X-A2A-File-Path": out.rel,
+      "X-A2A-File-Sha256": out.sha256,
+    });
+    res.end(out.data);
+  }
+
+  private queryOf(req: http.IncomingMessage): URLSearchParams {
+    const u = new URL(req.url ?? "", "http://localhost");
+    return u.searchParams;
+  }
+
+  /** 读取原始 body（非 JSON），带上限。 */
+  private readRawBody(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const len = parseInt(req.headers["content-length"] ?? "0", 10);
+      if (Number.isFinite(len) && len > maxBytes) return reject(new Error("too large"));
+      const chunks: Buffer[] = [];
+      let total = 0;
+      req.on("data", (c) => {
+        const buf = c as Buffer;
+        total += buf.length;
+        if (total > maxBytes) {
+          reject(new Error("too large"));
+          req.destroy();
+          return;
+        }
+        chunks.push(buf);
+      });
+      req.on("end", () => resolve(Buffer.concat(chunks)));
+      req.on("error", reject);
+    });
+  }
+
+  /** 客户端：把本地沙箱文件推送到 peer。 */
+  async putFile(
+    peerName: string,
+    localRel: string,
+    remoteRel: string,
+    overwrite: boolean,
+  ): Promise<{ path: string; bytes: number; sha256: string }> {
+    const peer = this.getPeer(peerName);
+    if (!peer) throw new Error(`peer not found: ${peerName}`);
+    const out = readOutgoingFile(this.fileRoot(), localRel);
+    if (out.bytes > this.fileMaxBytes()) throw new Error(`file exceeds fileMaxBytes (${out.bytes})`);
+    const q = new URLSearchParams({
+      path: remoteRel,
+      sha256: out.sha256,
+      overwrite: overwrite ? "1" : "0",
+    });
+    const url = `http://${peer.host}:${peer.port}${this.filePath}?${q.toString()}`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        Authorization: `Bearer ${this.config.workspaceSecret}`,
+      },
+      body: new Uint8Array(out.data),
+    });
+    const j = (await resp.json().catch(() => ({}))) as any;
+    if (!resp.ok) throw new Error(j?.error || `HTTP ${resp.status}`);
+    return { path: j.path, bytes: j.bytes, sha256: j.sha256 };
+  }
+
+  /** 客户端：从 peer 拉取文件到本地沙箱。 */
+  async getFile(
+    peerName: string,
+    remoteRel: string,
+    localRel: string,
+    overwrite: boolean,
+  ): Promise<{ path: string; bytes: number; sha256: string }> {
+    const peer = this.getPeer(peerName);
+    if (!peer) throw new Error(`peer not found: ${peerName}`);
+    const q = new URLSearchParams({ path: remoteRel });
+    const url = `http://${peer.host}:${peer.port}${this.filePath}?${q.toString()}`;
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${this.config.workspaceSecret}` },
+    });
+    if (!resp.ok) {
+      const j = (await resp.json().catch(() => ({}))) as any;
+      throw new Error(j?.error || `HTTP ${resp.status}`);
+    }
+    const shaHeader = resp.headers.get("x-a2a-file-sha256") ?? undefined;
+    const buf = Buffer.from(await resp.arrayBuffer());
+    const got = writeReceivedFile(this.fileRoot(), localRel, buf, shaHeader, overwrite);
+    this.hooks.log?.(`file 拉取: ${got.rel} (${got.bytes} bytes)`);
+    return { path: got.rel, bytes: got.bytes, sha256: got.sha256 };
   }
 
   private readBody(req: http.IncomingMessage): Promise<any> {
