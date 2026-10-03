@@ -156,7 +156,7 @@ All of it goes through one tool, `a2a_remote`:
 | `op` | Required | Optional | Effect on the peer |
 |------|----------|----------|--------------------|
 | `provision` | `peer`, `path` | `git`, `ref`, `submodules` | Create the directory; when `git` is given, clone it (or fetch + update an existing checkout) and check out `ref` / init submodules. |
-| `open` | `peer`, `path` | `git`, `ref`, `submodules`, `name`, `model`, `thinking`, `prompt`, `sessionId`, `timeoutMs` | Provision first if `git` is given, then start (or reuse) a pi session rooted at `path`. Returns a `handle`. |
+| `open` | `peer`, `path` | `git`, `ref`, `submodules`, `name`, `model`, `thinking`, `prompt`, `sessionId`, `timeoutMs` | Provision first if `git` is given, otherwise **refresh** an existing git checkout; then start (or reuse) a pi session rooted at `path`. Returns a `handle`. |
 | `prompt` | `peer`, `handle`, `message` | `timeoutMs` | Send a prompt into the session and return its final assistant text. |
 | `list` | `peer` | — | Show the peer's sessions. |
 | `close` | `peer`, `handle` | — | Dispose the session (kill the worker process). |
@@ -174,6 +174,13 @@ a2a_remote(peer="savitar", op="prompt", handle="sess_1a2b3c4d",
            message="Build the project and fix any compile errors in src/.")
 a2a_remote(peer="savitar", op="close", handle="sess_1a2b3c4d")
 ```
+
+`open` **refreshes an existing git checkout on every call**: `git fetch --all
+--prune --tags`, then fast-forward the current branch to its upstream (or check
+out `ref` when one is given), so a session never starts from a stale tree. It
+never discards local work — a diverged, dirty, or detached tree is left as-is and
+reported via `ff`. If the refresh fails (for example, the host is offline) the
+session still opens and the caller sees the `refreshError` warning.
 
 How it works: the peer spawns a child `pi --mode rpc` process with `cwd` = the
 workspace path and a stable `--session-id`, so its `read`/`bash`/`edit`/`write`

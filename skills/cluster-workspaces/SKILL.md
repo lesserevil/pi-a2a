@@ -29,7 +29,7 @@ only need one command and no project/session.
 | `op` | Required | Optional | Effect on the peer |
 |------|----------|----------|--------------------|
 | `provision` | `peer`, `path` | `git`, `ref`, `submodules` | Create the directory; if `git` given, clone it (or fetch + update an existing checkout) and optionally check out `ref` / init submodules. |
-| `open` | `peer`, `path` | `git`, `ref`, `submodules`, `name`, `model`, `thinking`, `prompt`, `sessionId`, `timeoutMs` | Provision first if `git` is given, then start (or reuse) a pi session rooted at `path`. Returns a `handle`. If `prompt` is given it is run immediately. |
+| `open` | `peer`, `path` | `git`, `ref`, `submodules`, `name`, `model`, `thinking`, `prompt`, `sessionId`, `timeoutMs` | Provision first if `git` is given; otherwise **refresh** an existing git checkout (`fetch` + `ref`). Then start (or reuse) a pi session rooted at `path`. Returns a `handle`. If `prompt` is given it is run immediately. |
 | `prompt` | `peer`, `handle`, `message` | `timeoutMs` | Send `message` into that session and return its final assistant text. |
 | `list` | `peer` | — | Show the peer's sessions (`handle`, path, name, session id, alive, turns). |
 | `close` | `peer`, `handle` | — | Dispose the session (kills the worker process). |
@@ -70,6 +70,12 @@ a2a_remote(peer="godspeed", op="provision", path="~/src/api",
 
 ## What happens on the peer
 
+- `open` always refreshes an existing git checkout: `git fetch`, then
+  fast-forward the current branch to its upstream (or check out `ref` when one is
+  given), so a session never starts from a stale tree. Local work is never
+  discarded; a diverged/dirty/detached tree is left as-is (`ff: false`). If the
+  refresh fails (e.g. the host is offline) the session still opens and the
+  warning is returned in the result.
 - The peer spawns a child `pi --mode rpc` process with `cwd` = the workspace
   path and a stable `--session-id`. The session is **persisted and resumable**:
   if the peer's bridge restarts, the next `prompt` transparently respawns the

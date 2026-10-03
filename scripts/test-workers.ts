@@ -81,6 +81,13 @@ async function main(): Promise<void> {
     const p2 = await mgr.provision({ path: "clone-a", git: srcRepo });
     check("action=updated", p2.action === "updated", JSON.stringify(p2));
 
+    // a new upstream commit: opening the existing checkout (without a git URL) must fast-forward to it
+    fs.writeFileSync(path.join(srcRepo, "CHANGELOG.md"), "v2\n");
+    git(srcRepo, ["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"]);
+    git(srcRepo, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "second"]);
+    const srcHead = execFileSync("git", ["-C", srcRepo, "rev-parse", "HEAD"]).toString().trim();
+    check("upstream advanced", srcHead !== String(p1.head));
+
     console.log("\n3. provision without git (mkdir)");
     const p3 = await mgr.provision({ path: "empty-ws" });
     check("action=created", p3.action === "created");
@@ -93,6 +100,8 @@ async function main(): Promise<void> {
     check("alive", opened.alive === true);
     check("sessionId returned", typeof opened.sessionId === "string" && opened.sessionId.length > 0);
     check("path resolved", opened.path === path.join(tmp, "clone-a"), String(opened.path));
+    check("open refreshed to upstream head", opened.provision?.head === srcHead, `local=${opened.provision?.head} upstream=${srcHead}`);
+    check("open fast-forwarded", opened.provision?.ff === true, JSON.stringify(opened.provision));
 
     console.log("\n5. list");
     const l = mgr.list();

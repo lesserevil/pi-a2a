@@ -647,6 +647,7 @@ export default function (pi: ExtensionAPI) {
       "Use a2a_remote when the work must happen on another host (different OS/hardware/repo) and needs its own project checkout and session rather than a one-off command.",
       "Flow: a2a_remote(op='open', peer, path, git=<url>, ref=<branch>) provisions the checkout and opens a session in one step; then a2a_remote(op='prompt', peer, handle, message) sends work to it; use op='close' when done.",
       "op='provision' only sets up the working copy; op='open' requires `path`, and provisions first when `git` is given.",
+      "op='open' always refreshes an existing git checkout (fetch + optional ref checkout) before starting, so sessions never run on a stale tree; if the refresh fails (e.g. offline) the session still opens and the warning is reported.",
       "Remote sessions run a full pi agent with file/bash tools rooted at `path`, so prompts can be multi-step coding tasks; the reply is the session's final assistant text.",
       "The peer must advertise [remote-sessions] in a2a_peers; the shared secret is the only credential, so only target peers you trust.",
       "For a single command on another host, prefer a remote-exec (a2a_send kind=request, subject 'exec: …') instead of a session.",
@@ -717,7 +718,8 @@ export default function (pi: ExtensionAPI) {
               timeoutMs: params.timeoutMs,
             });
             let text = `✅ session ${r.reused ? "reused" : "opened"} on ${peer}\n   handle: ${r.handle}\n   path: ${r.path}\n   session: ${r.sessionId}\n   name: ${r.name}`;
-            if (r.provision) text += `\n   provision: ${r.provision.action} (head ${r.provision.head ?? "n/a"})`;
+            if (r.provision) text += `\n   git: ${r.provision.action} (head ${r.provision.head ?? "n/a"})`;
+            if (r.refreshError) text += `\n   ⚠️ refresh failed, opened the existing tree as-is: ${r.refreshError}`;
             if (typeof r.reply === "string") text += `\n\n── reply ──\n${r.reply}`;
             return textResult(text, { peer, ...r });
           }

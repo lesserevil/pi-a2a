@@ -542,6 +542,37 @@ export class WorkerManager implements WorkerOps {
     await this.git(["-C", dest, "checkout", "--detach", "FETCH_HEAD"], dest);
   }
 
+  /**
+   * Refresh an existing checkout; used on every open and on provision.
+   * Always fetches. With `ref` it checks that ref out; without one it
+   * fast-forwards the current branch to its upstream. It never discards local
+   * work: a diverged/dirty/detached tree is left as-is and reported via `ff`.
+   */
+  private async updateCheckout(dest: string, opts: { ref?: string; submodules?: boolean }): Promise<any> {
+    await this.git(["-C", dest, "fetch", "--all", "--prune", "--tags"], dest);
+    let ff: boolean | null = null;
+    if (opts.ref) {
+      await this.checkoutRef(dest, opts.ref);
+    } else {
+      try {
+        await this.git(["-C", dest, "merge", "--ff-only", "@{u}"], dest);
+        ff = true;
+      } catch (e) {
+        // no upstream, detached HEAD, diverged, or dirty tree → keep the current tree
+        ff = false;
+        this.log(`fast-forward skipped for ${dest}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    if (opts.submodules) await this.git(["-C", dest, "submodule", "update", "--init", "--recursive"], dest);
+    return {
+      path: dest,
+      action: "updated",
+      head: await this.gitStdout(["-C", dest, "rev-parse", "HEAD"], dest),
+      branch: await this.gitStdout(["-C", dest, "rev-parse", "--abbrev-ref", "HEAD"], dest).catch(() => ""),
+      ff,
+    };
+  }
+
   async provision(params: any): Promise<any> {
     this.assertAllowed();
     const dest = this.resolveWorkspacePath(params?.path);
@@ -556,15 +587,7 @@ export class WorkerManager implements WorkerOps {
     }
 
     if (fs.existsSync(path.join(dest, ".git"))) {
-      await this.git(["-C", dest, "fetch", "--all", "--prune", "--tags"], dest);
-      if (ref) await this.checkoutRef(dest, ref);
-      if (submodules) await this.git(["-C", dest, "submodule", "update", "--init", "--recursive"], dest);
-      return {
-        path: dest,
-        action: "updated",
-        head: await this.gitStdout(["-C", dest, "rev-parse", "HEAD"], dest),
-        branch: await this.gitStdout(["-C", dest, "rev-parse", "--abbrev-ref", "HEAD"], dest).catch(() => ""),
-      };
+      return this.updateCheckout(dest, { ref, submodules });
     }
 
     if (fs.existsSync(dest) && fs.readdirSync(dest).length > 0) {
@@ -591,6 +614,7 @@ export class WorkerManager implements WorkerOps {
     this.assertAllowed();
     const dest = this.resolveWorkspacePath(params?.path);
     let provisionResult: any = null;
+    let refreshError: string | null = null;
     const gitUrl = typeof params?.git === "string" ? params.git.trim() : "";
     if (gitUrl) {
       provisionResult = await this.provision({
@@ -600,6 +624,19 @@ export class WorkerManager implements WorkerOps {
         submodules: params?.submodules,
         depth: params?.depth,
       });
+    } else if (fs.existsSync(path.join(dest, ".git"))) {
+      // refresh an existing checkout on every open, even when no git URL is given,
+      // so a session never works on a stale tree. Best-effort: if the fetch fails
+      // (e.g. offline) the session still opens; the caller sees refreshError.
+      try {
+        provisionResult = await this.updateCheckout(dest, {
+          ref: typeof params?.ref === "string" ? params.ref.trim() : "",
+          submodules: params?.submodules === true,
+        });
+      } catch (e) {
+        refreshError = e instanceof Error ? e.message : String(e);
+        this.log(`refresh failed for ${dest}: ${refreshError}`);
+      }
     }
     fs.mkdirSync(dest, { recursive: true });
 
@@ -618,9 +655,9 @@ export class WorkerManager implements WorkerOps {
       const info: WorkerInfo = { ...existing.info, alive: true };
       if (typeof params?.prompt === "string" && params.prompt.trim()) {
         const r = await this.prompt({ handle: info.handle, message: params.prompt, timeoutMs: params.timeoutMs });
-        return { ...info, reused: true, provision: provisionResult, reply: r.reply, elapsedMs: r.elapsedMs };
+        return { ...info, reused: true, provision: provisionResult, refreshError, reply: r.reply, elapsedMs: r.elapsedMs };
       }
-      return { ...info, reused: true, provision: provisionResult };
+      return { ...info, reused: true, provision: provisionResult, refreshError };
     }
 
     if (this.liveCount() >= this.maxSessions()) {
@@ -654,7 +691,7 @@ export class WorkerManager implements WorkerOps {
       throw e;
     }
 
-    const result: any = { ...info, alive: true, reused: false, provision: provisionResult };
+    const result: any = { ...info, alive: true, reused: false, provision: provisionResult, refreshError };
     if (typeof params?.prompt === "string" && params.prompt.trim()) {
       const r = await this.prompt({ handle, message: params.prompt, timeoutMs: params.timeoutMs });
       result.reply = r.reply;
