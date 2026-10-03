@@ -166,11 +166,36 @@ async function startEngine(ctx: any): Promise<void> {
           const subj = m.subject ? `主题: ${m.subject}\n\n` : "";
           let prompt: string;
           if (m.kind === "request") {
-            prompt =
-              `📥 来自 @${m.from_name} 的任务请求\n` +
-              subj +
-              `${m.body}\n\n` +
-              `——\n请处理这个请求，完成后调用 a2a_reply(message_id="${m.id}", body="<结果或处理说明>") 把结果回给 @${m.from_name}。`;
+            const isExec = (m.subject || "").trim().toLowerCase().startsWith("exec:") ||
+              /^\s*workdir:/m.test(m.body || "") || /^\s*session:/m.test(m.body || "");
+            if (isExec) {
+              // Remote-exec: force an exact, machine-parsable reply. The remote
+              // agent must run the command and return ONLY the block below.
+              prompt =
+                `📥 来自 @${m.from_name} 的远程执行请求\n` +
+                subj +
+                `${m.body}\n\n` +
+                `——\n` +
+                `这是 remote-exec 请求。按 remote-exec skill 处理：解析 body 顶部可选的 \`workdir:\` / \`session:\` 行，` +
+                `用 bash 工具在本机执行 fenced 代码块里的命令（有 workdir 则在其目录下执行），` +
+                `然后调用 a2a_session 取得本会话 id（若请求给了 session 则回填该 id）。\n\n` +
+                `回复时调用 a2a_reply(message_id="${m.id}", body=...)，body 必须【只】包含下面这个块，` +
+                `字段顺序、小写键名完全一致，不要有任何额外说明、markdown 围栏或前后文字：\n` +
+                `host: <你的 hostname>\n` +
+                `workdir: <命令实际运行的绝对目录>\n` +
+                `session: <回填给调用方的 session id>\n` +
+                `exit: <整数退出码；未执行则为 -1>\n` +
+                `stdout:\n` +
+                `<原样 stdout>\n` +
+                `stderr:\n` +
+                `<原样 stderr，无则留空>`;
+            } else {
+              prompt =
+                `📥 来自 @${m.from_name} 的任务请求\n` +
+                subj +
+                `${m.body}\n\n` +
+                `——\n请处理这个请求，完成后调用 a2a_reply(message_id="${m.id}", body="<结果或处理说明>") 把结果回给 @${m.from_name}。`;
+            }
           } else if (m.kind === "result") {
             // result：对方交付了之前委派任务的返回结果，注入让本 agent 自动接收/知晓。
             prompt =
@@ -555,8 +580,12 @@ export default function (pi: ExtensionAPI) {
       if (!ctx) return textResult("⚠️ 会话上下文不可用（session context unavailable）。");
       try {
         if (params.name) ctx.setSessionName?.(params.name);
-        const sessionId: string | undefined = ctx.sessionId ?? ctx.getSessionId?.();
-        const sessionName: string | undefined = ctx.getSessionName?.() ?? params.name;
+        // Session id/file live on the read-only session manager, not on ctx itself.
+        const sm = ctx.sessionManager;
+        const sessionId: string | undefined =
+          sm?.getSessionId?.() ?? ctx.sessionId ?? ctx.getSessionId?.();
+        const sessionName: string | undefined =
+          sm?.getSessionName?.() ?? ctx.getSessionName?.() ?? params.name;
         return {
           content: [
             {
