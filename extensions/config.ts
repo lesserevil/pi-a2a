@@ -10,6 +10,7 @@
  *     "role": "writes the API",
  *     "listenPort": 0,                   // 可选，0 = OS 分配
  *     "advertiseHost": "192.168.1.50",   // 可选，手动指定对外广告 host（多网卡/Docker/WSL 自动检测错误时用）
+ *     "mdnsInterface": "192.168.1.50",    // 可选，把 mDNS 组播绑定到指定网卡（多网卡默认路由走错时用；同网段多地址的主机不要设置）
  *     // ── A2A 端点/时序（均可选，有默认）─────────────
  *     "agentCardPath": "/.well-known/agent-card.json",
  *     "rpcPath": "/rpc",                  // JSON-RPC 单端点
@@ -34,6 +35,7 @@ export interface A2aConfig {
   role?: string;
   listenPort?: number; // 可选，0 = OS 分配（默认 0）
   advertiseHost?: string; // 可选，手动指定对外广告 host（agent card / push webhook URL 用）；多网卡/Docker/WSL 环境自动检测到虚拟网卡时用此项覆盖
+  mdnsInterface?: string; // 可选，将 mDNS/组播 socket 绑定到此网卡地址。仅当本机默认组播出口走错网卡时设置（例如 Windows + Tailscale）。同一局域网内拥有多个地址的多网卡主机请勿设置，否则会收不到 peer 的公告。
   // ── A2A 端点/时序（均可选）──────────────────────────
   agentCardPath?: string; // 默认 /.well-known/agent-card.json
   rpcPath?: string; // 默认 /rpc（JSON-RPC 单端点）

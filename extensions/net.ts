@@ -763,7 +763,14 @@ export class Network {
       return;
     }
     try {
-      this.bonjour = new BonjourCtor();
+      // Optional: pin the mDNS/multicast socket to one interface. Only set this
+      // via config `mdnsInterface` on a host whose default multicast route goes
+      // out the wrong adapter (e.g. Windows with Tailscale up, where the VPN
+      // interface has a lower route metric and multicast never reaches the LAN).
+      // Multi-homed hosts with several addresses on the same LAN should leave it
+      // unset, otherwise they stop hearing peers advertised on the other address.
+      const bindIface = this.config.mdnsInterface?.trim();
+      this.bonjour = bindIface ? new BonjourCtor({ interface: bindIface }) : new BonjourCtor();
       const instanceName = `${this.config.peerName}@${this.config.agentId.slice(0, 8)}@${process.pid}`;
       this.service = this.bonjour.publish({
         name: instanceName,
