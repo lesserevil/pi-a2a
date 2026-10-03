@@ -24,8 +24,9 @@ contains a command, and the remote agent runs it and replies with the result
 
 ## Requesting a remote command (you are the caller)
 
-Send a single `kind=request` message. Put a **fenced `sh` block** in the body so
-the remote agent has an unambiguous command, and state the expected host:
+Send a single `kind=request` message. The body has two parts: an optional
+**header block** of `key: value` lines, then a **fenced `sh` block** with the
+command. Keep the subject prefixed with `exec:`.
 
 ```
 a2a_send(
@@ -33,6 +34,9 @@ a2a_send(
   subject="exec: <one-line summary>",
   kind="request",
   body="""
+workdir: /home/me/project      # optional: run the command in this directory
+session: 01a0ff96-...          # optional: continue a previous exec session
+
 Run this on your host and reply with the result.
 
 ```sh
@@ -40,6 +44,29 @@ uname -a && df -h /
 ```
 """)
 ```
+
+### Header lines
+
+| Line | Required | Meaning |
+|------|----------|---------|
+| `workdir: <path>` | no | Run the command with this working directory. If omitted, the remote agent's own cwd is used. |
+| `session: <id>` | no | Continue in a previously returned exec session, so the remote agent keeps conversation context across calls. If omitted, a **new session** is started and its id is returned in the reply. |
+
+Put these lines at the very top of the body, one per line, before any prose.
+Omit a line entirely when you don't need it — do not send empty values.
+
+### Session continuity
+
+- **First call:** omit `session:`. The reply carries a fresh `session:` id.
+- **Later calls:** include that same `session:` id to keep the remote agent's
+  context (e.g. shell state it remembers, files it already read, earlier
+  decisions). This is what makes a sequence of commands behave like one
+  working session on the other host.
+- Sessions are **resumable** across restarts: the remote agent persists them,
+  so a `session:` id remains valid after the peer restarts.
+- Sessions are **one at a time** per peer: the remote host has a single active
+  session, so do not interleave concurrent requests that expect different
+  sessions. Serialize calls that share a host.
 
 Guidelines:
 - Keep `subject` prefixed with `exec:` so remote agents recognise it.
@@ -50,18 +77,27 @@ Guidelines:
 - Prefer commands that print machine-parsable output.
 - If you need a specific interpreter or shell, say so (e.g. "run with bash").
 - If the command is destructive, say exactly what it will change and why.
+- Use `workdir:` rather than baking `cd` into the command when the whole task
+  belongs in one directory.
 
 ## Handling a remote-exec request (you are the remote agent)
 
 When you receive a `kind=request` whose subject starts with `exec:` (or whose
 body clearly asks you to run a command):
 
-1. Extract the command from the fenced block.
-2. **Run it on your own host** with the `bash` tool. Your host is the one that
-   executes — do not forward it onward.
-3. Reply with `a2a_reply(message_id, body=...)` using the structured format
+1. Read the optional header lines at the top of the body (`workdir:`, `session:`).
+2. Extract the command from the fenced block.
+3. If a `session:` line was present, this request continues an existing exec
+   session — keep using your current session and **echo that same id back**.
+   If it was absent, you are starting a fresh session: call `a2a_session` with a
+   name like `exec:<caller>` to get your session id to return.
+4. **Run the command on your own host** with the `bash` tool. Your host is the
+   one that executes — do not forward it onward. If a `workdir:` line was
+   given, run with that directory (e.g. `cd <workdir> && <command>`), and
+   verify it exists first; if it does not, fail with `exit: -1`.
+5. Reply with `a2a_reply(message_id, body=...)` using the structured format
    below, so the caller gets usable output.
-4. Do not editorialise; report the raw result. If the command failed, say so
+6. Do not editorialise; report the raw result. If the command failed, say so
    and include stderr.
 
 ### Reply format (remote agent MUST use this exactly)
@@ -72,6 +108,8 @@ lowercase keys and a single space after the colon. Omit nothing.
 
 ```
 host: <your hostname> <-- exactly one line; no spaces in the value>
+workdir: <absolute path the command actually ran in>
+session: <session id to reuse for subsequent calls>
 exit: <integer exit code, or -1 if you did not run the command>
 stdout:
 <verbatim stdout, trailing blank lines trimmed>
@@ -80,7 +118,13 @@ stderr:
 ```
 
 Hard rules:
-- `host:` and `exit:` are each a single line. Do not wrap them.
+- `host:`, `workdir:`, `session:`, and `exit:` are each a single line. Do not
+  wrap them.
+- `session:` is the id the caller should send back next time. If the request
+  carried a `session:` line, echo that exact id here; otherwise use the id
+  returned by `a2a_session`.
+- `workdir:` is the resolved absolute directory the command ran in, even when
+  the request omitted it (then it is your own cwd).
 - The `stdout:` and `stderr:` keys sit alone on their own line, followed by
   the captured text on the following lines.
 - Do **not** add commentary, summaries, markdown fences, or reasoning to the
@@ -93,6 +137,8 @@ Example reply body (this is the entire body):
 
 ```
 host: plaz
+workdir: /home/shedwards/a2a
+session: 01a0ff96-7f3f-727f-b998-c54c65f53fcc
 exit: 0
 stdout:
 Linux plaz 7.0.0-34-generic #34-Ubuntu SMP x86_64 GNU/Linux
@@ -102,8 +148,10 @@ stderr:
 ```
 
 Caveats, still inside the same block:
-- If the command was **not** run (unsafe, interactive, missing tool), set
-  `exit: -1` and put the reason on the `stderr:` lines.
+- If the command was **not** run (unsafe, interactive, missing tool, bad
+  workdir), set `exit: -1` and put the reason on the `stderr:` lines. Still
+  include a valid `session:` and a `workdir:` (use your own cwd if the
+  requested one was invalid).
 - If output is huge, truncate it and append a single line `... (truncated)` at
   the end of the stdout block. The 512KB message cap is a hard limit.
 
@@ -112,10 +160,13 @@ Caveats, still inside the same block:
 - Wait for the pushed `result` (it arrives automatically; you may also see it in
   `a2a_inbox`). It is injected into your session when it arrives.
 - Parse the block by splitting on the first occurrence of each key in order:
-  `host:`, `exit:`, `stdout:`, `stderr:`.
+  `host:`, `workdir:`, `session:`, `exit:`, `stdout:`, `stderr:`.
 - Treat a non-zero `exit` (including `-1`) as failure and surface `stderr`.
 - Always verify `host:` matches the peer you asked. Misconfigured peers or a
   broadcast could answer from the wrong host.
+- **Remember `session:`** from the reply and include it in your next request to
+  the same host to keep context. Confirm `workdir:` matches what you asked for
+  (or is what you expect) when you sent one.
 - If the reply does not match the format above, say so and, if needed, re-send
   the request asking the peer to use the exact format.
 - Report the command and its result to the user, not just the parsed value.
@@ -136,6 +187,7 @@ Caveats, still inside the same block:
 
 | Direction | Action |
 |---|---|
-| Caller | `a2a_send(to=peer, subject="exec: …", kind="request", body=<fenced sh>)` |
-| Remote | run with `bash`, then `a2a_reply(message_id, host/exit/stdout/stderr)` |
-| Caller | read pushed result, check `host` + `exit`, report to user |
+| Caller | `a2a_send(to=peer, subject="exec: …", kind="request", body=<headers + fenced sh>)` |
+| Caller headers | optional `workdir: <path>` and `session: <id>` on the first lines of the body |
+| Remote | read headers, run with `bash` (in `workdir` if given), `a2a_session` for a new id, then `a2a_reply` with `host/workdir/session/exit/stdout/stderr` |
+| Caller | read pushed result, check `host` + `exit`, remember `session:` for the next call, report to user |

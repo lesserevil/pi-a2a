@@ -534,6 +534,44 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── Tool: a2a_session ─────────────────────────────────────
+  pi.registerTool({
+    name: "a2a_session",
+    label: "A2A Session",
+    description:
+      "Report the current pi session identity (id + name) used to give remote-exec callers a stable session to continue in. Optionally set the session name. Use when a remote-exec request carries a session: line or when you must return a session id to a caller.",
+    promptSnippet: "Read or name the current session for remote-exec continuity",
+    promptGuidelines: [
+      "Use a2a_session to get the current session id when replying to a remote-exec request.",
+      "If the caller sent a session: line, echo it back; otherwise reply with the id a2a_session returns so the caller can reuse it.",
+    ],
+    parameters: Type.Object({
+      name: Type.Optional(
+        Type.String({ description: "Optional: set the session display name (e.g. 'exec:box') before returning the id." }),
+      ),
+    }),
+    async execute(_id, params) {
+      const ctx = state.lastCtx;
+      if (!ctx) return textResult("⚠️ 会话上下文不可用（session context unavailable）。");
+      try {
+        if (params.name) ctx.setSessionName?.(params.name);
+        const sessionId: string | undefined = ctx.sessionId ?? ctx.getSessionId?.();
+        const sessionName: string | undefined = ctx.getSessionName?.() ?? params.name;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ session: sessionId ?? null, name: sessionName ?? null }),
+            },
+          ],
+          details: { sessionId: sessionId ?? null, sessionName: sessionName ?? null },
+        };
+      } catch (e) {
+        return textResult(`⚠️ 无法读取会话: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    },
+  });
+
   // ── Tool: a2a_mem_set ─────────────────────────────────────
   pi.registerTool({
     name: "a2a_mem_set",

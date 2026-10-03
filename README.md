@@ -106,6 +106,7 @@ Config is saved **per-project** to `.pi/pi-a2a.json` (there is no global config)
 | `a2a_read` | Read full message body by id (any message in a thread), marks as read |
 | `a2a_reply` | Reply in a thread (recipient auto-detected; accepts any message id) |
 | `a2a_peers` | List online agents and their roles |
+| `a2a_session` | Read (or name) the current pi session id, for remote-exec session continuity |
 | `a2a_mem_set` / `a2a_mem_get` / `a2a_mem_keys` / `a2a_mem_delete` | Workspace shared memory (KV, replicated to peers) |
 
 Tool signatures are unchanged from the previous (server-backed) version — only the implementation moved to P2P.
@@ -127,8 +128,11 @@ agent (e.g. Linux-only tools, a headless server, a different machine's data).
 It is plain a2a delegation, just with a defined message contract:
 
 1. **Caller** discovers peers with `a2a_peers`, then sends a `kind=request`
-   message whose subject starts with `exec:` and whose body contains a fenced
-   `sh` block. In prose, the body looks like:
+   message whose subject starts with `exec:`. The body has an optional header
+   block followed by a fenced `sh` block. In prose, the body looks like:
+
+       workdir: /home/me/project
+       session: 01a0ff96-...
 
        Run this on your host and reply with the result.
 
@@ -141,19 +145,30 @@ It is plain a2a delegation, just with a defined message contract:
        a2a_send(to="plaz", subject="exec: uname -a",
                 kind="request", body="<the text above>")
 
-2. **Remote agent** runs the command with its own `bash` tool and replies with
-   `a2a_reply(message_id, body=<result>)`. The reply body is a machine-readable
+   - `workdir: <path>` (optional) — run the command in this directory.
+   - `session: <id>` (optional) — continue a previous exec session. Omit it on
+     the first call; pass the id returned by the reply on later calls to keep
+     the remote agent's context across requests. Sessions are persisted and
+     resumable across restarts, and are one-at-a-time per peer.
+
+2. **Remote agent** reads the headers, runs the command with its own `bash`
+   tool (in `workdir` if given), and replies with
+   `a2a_reply(message_id, body=<result>)`. For a new session it calls
+   `a2a_session` to obtain the id to return. The reply body is a machine-readable
    block — nothing else:
 
        host: plaz
+       workdir: /home/me/project
+       session: 01a0ff96-7f3f-727f-b998-c54c65f53fcc
        exit: 0
        stdout:
        Linux plaz 7.0.0-34-generic #34-Ubuntu SMP x86_64 GNU/Linux
        stderr:
 
 3. **Caller** receives the pushed `result` (auto-injected), parses
-   `host`/`exit`/`stdout`/`stderr`, verifies `host` matches the peer it asked,
-   and treats non-zero `exit` (including `-1`) as failure.
+   `host`/`workdir`/`session`/`exit`/`stdout`/`stderr`, verifies `host` matches
+   the peer it asked, remembers `session` for the next call, and treats non-zero
+   `exit` (including `-1`) as failure.
 
 The skill covers the request/reply conventions, the exact reply format,
 truncation rules, and safety guidance (non-interactive commands only; no
