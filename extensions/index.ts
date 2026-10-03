@@ -1,17 +1,17 @@
 /**
- * pi-a2a — Agent-to-agent message bus for pi coding agent (局域网 P2P 版)
+ * pi-a2a — Agent-to-agent message bus for pi coding agent (LAN P2P edition)
  *
- * 同一局域网内、同一 workspace + 共享密钥 的 pi agent 自动互相发现、点对点收发。
- * 无中心服务器、无云端依赖、无需部署。每个 agent 本地各自存储。
+ * pi agents on the same LAN with the same workspace + shared secret discover each other automatically and exchange messages peer-to-peer.
+ * No central server, no cloud dependency, no deployment. Each agent stores its own data locally.
  *
- * 发现: mDNS/Bonjour (bonjour-service) 广告 + 浏览 _pi-a2a._tcp
- * 传输: 每个 agent 本地起 HTTP server（node:http），点对点直推
- * 存储: 本地 JSON 文件（store.ts），inbox + sent 副本，本地还原完整线程
- * 异步: 对方离线 → 本地 outbox 暂存；对方上线自动重投（无需同时在线）
+ * Discovery: mDNS/Bonjour (bonjour-service) advertise + browse _pi-a2a._tcp
+ * Transport: each agent runs a local HTTP server (node:http) and pushes peer-to-peer
+ * Storage: local JSON files (store.ts); inbox + sent copies reconstruct the full thread locally
+ * Async: peer offline → queued in the local outbox; redelivered automatically when the peer comes online (no need to be online simultaneously)
  *
  * Tools:    a2a_send, a2a_inbox, a2a_read, a2a_reply, a2a_peers
  * Commands: /a2a-setup, /a2a, /a2a-clear, /a2a-send, /a2a-inbox, /a2a-peers
- * Widget:   本地未读数 + 在线 peer（事件驱动刷新 + 低频兜底）
+ * Widget:   local unread count + online peers (event-driven refresh + low-frequency fallback)
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -29,7 +29,7 @@ import { Store, type Message, type MsgKind } from "./store.ts";
 import { Network, type Peer } from "./net.ts";
 import { resolveFileRoot } from "./files.ts";
 
-// ── 状态 ────────────────────────────────────────────────────
+// ── state ───────────────────────────────────────────────────
 
 interface LiveState {
   config: A2aConfig | null;
@@ -37,7 +37,7 @@ interface LiveState {
   store: Store | null;
   net: Network | null;
   unread: number;
-  lastCtx: any; // 最近一次 ctx，供 widget 重绘 / toast
+  lastCtx: any; // most recent ctx, used for widget redraw / toast
   widgetTimer: ReturnType<typeof setInterval> | null;
 }
 
@@ -52,11 +52,11 @@ const state: LiveState = {
 };
 
 const NO_CONFIG_MSG =
-  "⚠️ pi-a2a 尚未配置。请运行 `/a2a-setup` 设置工作区名、共享密钥和 agent 名字。";
+  "⚠️ pi-a2a is not configured. Run `/a2a-setup` to set the workspace name, shared secret and agent name.";
 
-const WIDGET_REFRESH_MS = 5000; // 低频兜底刷新（新消息/上下线主要由事件驱动）
+const WIDGET_REFRESH_MS = 5000; // low-frequency fallback refresh (new messages / presence are mostly event-driven)
 
-// ── 小工具 ──────────────────────────────────────────────────
+// ── helpers ─────────────────────────────────────────────────
 
 function genMsgId(): string {
   return "msg_" + crypto.randomBytes(5).toString("hex"); // 10 hex
@@ -67,10 +67,10 @@ function nowSec(): number {
 
 function notReady(): string {
   if (!state.config) return NO_CONFIG_MSG;
-  return "⏳ pi-a2a 尚未就绪（网络服务未启动）。稍候重试，或重新运行 /a2a-setup。";
+  return "⏳ pi-a2a is not ready (network service not started). Retry shortly, or run /a2a-setup again.";
 }
 
-/** 标准 text 工具结果。SDK 要求 AgentToolResult 必填 details（供日志/UI），这里默认空对象。 */
+/** Standard text tool result. The SDK requires AgentToolResult.details (for logs/UI); default to an empty object. */
 function textResult(
   text: string,
   details: Record<string, unknown> = {},
@@ -96,22 +96,22 @@ function redrawWidget(): void {
       (_tui: any, theme: any) => ({
         render(width: number) {
           if (!state.config) {
-            return [theme.fg("muted", "📨 pi-a2a 未配置（/a2a-setup）")];
+            return [theme.fg("muted", "📨 pi-a2a not configured (/a2a-setup)")];
           }
           const me = state.config.peerName;
           const peers = (state.net?.getOnlinePeers() ?? []).filter((p) => p.peerName !== me);
           const peersTxt =
             peers.length === 0
-              ? "（无其他 agent 在线）"
+              ? "(no other agents online)"
               : peers.map((p) => p.peerName + (p.role ? `·${p.role}` : "")).join(" ");
           const unreadTxt =
             state.unread > 0
-              ? theme.bold(theme.fg("warning", `📨 ${state.unread} 未读`))
-              : theme.fg("muted", "📭 收件箱空");
+              ? theme.bold(theme.fg("warning", `📨 ${state.unread} unread`))
+              : theme.fg("muted", "📭 inbox empty");
           const line1 =
             `🟢 a2a·${theme.bold(me)}` + (state.config.role ? `·${state.config.role}` : "");
           const line2 = `  ${unreadTxt}`;
-          const line3 = `  在线: ${peersTxt}`;
+          const line3 = `  online: ${peersTxt}`;
           return [line1, line2, line3].map((l) => (l.length > width ? l.slice(0, width - 1) + "…" : l));
         },
         invalidate() {},
@@ -119,28 +119,28 @@ function redrawWidget(): void {
       { placement: "belowEditor" },
     );
   } catch {
-    // ctx 可能已 stale（会话切换/退出后定时器仍触发）；静默跳过，
-    // 新会话 session_start 会重建 widget。
+    // ctx may be stale (timers still fire after session switch/exit); skip silently,
+    // a new session's session_start rebuilds the widget.
   }
 }
 
-// ── 引擎启停 ────────────────────────────────────────────────
+// ── engine start/stop ───────────────────────────────────────
 
 async function startEngine(ctx: any): Promise<void> {
   const cfg = state.config;
   if (!cfg) return;
-  // 存储与 ctx 同 scope；注入 onOutboxOverflow 让溢出能冒泡到 UI（防静默丢消息）
+  // storage shares scope with ctx; inject onOutboxOverflow so overflow surfaces in the UI (avoids silent message loss)
   const store = new Store(dbPathFor(ctx.cwd), {
     onOutboxOverflow: (peer, droppedId, subject) => {
       try {
         ctx.ui.notify(
-          `⚠️ outbox 溢出：给 @${peer} 的消息积压达上限，丢弃最旧「${subject}」`,
+          `⚠️ outbox overflow: messages queued for @${peer} hit the limit; dropping oldest "${subject}"`,
           "warning",
         );
       } catch {
         /* ignore */
       }
-      console.log(`[pi-a2a] ⚠️ outbox 溢出: peer=${peer} 丢弃 ${droppedId}「${subject}」`);
+      console.log(`[pi-a2a] ⚠️ outbox overflow: peer=${peer} dropping ${droppedId} "${subject}"`);
     },
   });
   store.load();
@@ -152,19 +152,19 @@ async function startEngine(ctx: any): Promise<void> {
     onMessageReceived: (m) => {
       recalcUnread();
       try {
-        ctx.ui.notify(`📨 ${m.from_name}: ${m.subject || "(无主题)"}`, "info");
+        ctx.ui.notify(`📨 ${m.from_name}: ${m.subject || "(no subject)"}`, "info");
       } catch {
         /* ignore */
       }
-      // request / result → 总是主动注入当前会话，形成委派闭环：
-      //   FE 发 request → BE 自动处理 → BE 回 result → FE 自动接收（无需手动 a2a_read）
-      // 普通消息(message)默认只通知不打扰；配置 autoInjectMessage=true 时也注入。
-      // deliverAs=followUp：本 agent 正忙时排队到当前 turn 之后，不中断；空闲时立即触发新 turn。
+      // request / result → always inject into the current session, closing the delegation loop:
+      //   FE sends request → BE handles it automatically → BE returns result → FE receives it automatically (no manual a2a_read)
+      // Plain messages notify without interrupting by default; also injected when autoInjectMessage=true.
+      // deliverAs=followUp: queue after the current turn when busy without interrupting; trigger a new turn immediately when idle.
       const autoInject =
         m.kind === "request" || m.kind === "result" || (m.kind === "message" && cfg.autoInjectMessage === true);
       if (autoInject) {
         try {
-          const subj = m.subject ? `主题: ${m.subject}\n\n` : "";
+          const subj = m.subject ? `Subject: ${m.subject}\n\n` : "";
           let prompt: string;
           if (m.kind === "request") {
             const isExec = (m.subject || "").trim().toLowerCase().startsWith("exec:") ||
@@ -173,50 +173,50 @@ async function startEngine(ctx: any): Promise<void> {
               // Remote-exec: force an exact, machine-parsable reply. The remote
               // agent must run the command and return ONLY the block below.
               prompt =
-                `📥 来自 @${m.from_name} 的远程执行请求\n` +
+                `📥 Remote-exec request from @${m.from_name}\n` +
                 subj +
                 `${m.body}\n\n` +
                 `——\n` +
-                `这是 remote-exec 请求。按 remote-exec skill 处理：解析 body 顶部可选的 \`workdir:\` / \`session:\` 行，` +
-                `用 bash 工具在本机执行 fenced 代码块里的命令（有 workdir 则在其目录下执行），` +
-                `然后调用 a2a_session 取得本会话 id（若请求给了 session 则回填该 id）。\n\n` +
-                `回复时调用 a2a_reply(message_id="${m.id}", body=...)，body 必须【只】包含下面这个块，` +
-                `字段顺序、小写键名完全一致，不要有任何额外说明、markdown 围栏或前后文字：\n` +
-                `host: <你的 hostname>\n` +
-                `workdir: <命令实际运行的绝对目录>\n` +
-                `session: <回填给调用方的 session id>\n` +
-                `exit: <整数退出码；未执行则为 -1>\n` +
+                `This is a remote-exec request. Handle it per the remote-exec skill: parse the optional \`workdir:\` / \`session:\` lines at the top of the body, ` +
+                `run the commands in the fenced code block on this host with the bash tool (inside workdir if given), ` +
+                `then call a2a_session to obtain this session's id (echo back the provided id if the request supplied one).\n\n` +
+                `Reply with a2a_reply(message_id="${m.id}", body=...); the body must contain ONLY the block below, ` +
+                `with the same field order and lowercase key names exactly, and no extra prose, markdown fences or surrounding text:\n` +
+                `host: <your hostname>\n` +
+                `workdir: <absolute directory the command actually ran in>\n` +
+                `session: <session id echoed back to the caller>\n` +
+                `exit: <integer exit code; -1 if not executed>\n` +
                 `stdout:\n` +
-                `<原样 stdout>\n` +
+                `<stdout verbatim>\n` +
                 `stderr:\n` +
-                `<原样 stderr，无则留空>`;
+                `<stderr verbatim, empty if none>`;
             } else {
               prompt =
-                `📥 来自 @${m.from_name} 的任务请求\n` +
+                `📥 Task request from @${m.from_name}\n` +
                 subj +
                 `${m.body}\n\n` +
-                `——\n请处理这个请求，完成后调用 a2a_reply(message_id="${m.id}", body="<结果或处理说明>") 把结果回给 @${m.from_name}。`;
+                `——\nHandle this request, then call a2a_reply(message_id="${m.id}", body="<result or explanation>") to return the result to @${m.from_name}.`;
             }
           } else if (m.kind === "result") {
-            // result：对方交付了之前委派任务的返回结果，注入让本 agent 自动接收/知晓。
+            // result: the peer delivered a previously delegated task's result; inject so this agent receives/knows about it automatically.
             prompt =
-              `📬 来自 @${m.from_name} 的结果回执\n` +
+              `📬 Result receipt from @${m.from_name}\n` +
               subj +
               `${m.body}\n\n` +
-              `——\n这是你之前委派任务的返回结果，已自动送达。如需继续追问，可用 a2a_reply(message_id="${m.id}", body="...")；否则无需任何操作。`;
+              `——\nThis is the result of a task you previously delegated; it has been delivered automatically. To follow up, use a2a_reply(message_id="${m.id}", body="..."); otherwise no action is needed.`;
           } else {
-            // message：普通消息，因 autoInjectMessage=true 而注入。
+            // message: plain message, injected because autoInjectMessage=true.
             prompt =
-              `📨 来自 @${m.from_name} 的消息\n` +
+              `📨 Message from @${m.from_name}\n` +
               subj +
               `${m.body}\n\n` +
-              `——\n如需回复，可用 a2a_reply(message_id="${m.id}", body="...")；否则无需任何操作。`;
+              `——\nTo reply, use a2a_reply(message_id="${m.id}", body="..."); otherwise no action is needed.`;
           }
           api?.sendUserMessage(prompt, { deliverAs: "followUp" });
-          // 自动注入=agent 已看到全文，立即标记已读，否则 unread 永不下降
-          // （agent 不会再调 a2a_read，因为它已经通过注入看到了 body）
-          // 注意：pi 的 sendUserMessage 是 fire-and-forget（内部 promise 不 return，
-          // 永远返回 undefined），无法用返回值判断投递成功；api?. 已挡住 api 缺失。
+          // auto-inject means the agent has already seen the full text; mark read immediately or unread never decreases
+          // (the agent won't call a2a_read again because it already saw the body via injection)
+          // note: pi's sendUserMessage is fire-and-forget (the internal promise isn't returned,
+          // it always returns undefined), so delivery can't be detected via the return value; api?. already guards against a missing api.
           store.markRead(m.id, cfg.peerName);
           store.persist();
           recalcUnread();
@@ -263,17 +263,17 @@ async function stopEngine(): Promise<void> {
   state.store = null;
 }
 
-// ── 扩展入口 ────────────────────────────────────────────────
+// ── extension entry point ───────────────────────────────────
 
-// 扩展 API 引用（工厂入参），供网络层回调在收到 kind=request 时
-// 调 pi.sendUserMessage 把任务注入当前会话 → 真正“调动”本 agent。
-// 普通消息(message)不注入，只通知；只有 request 会触发主动处理。
+// Extension API reference (factory argument) so the network layer can, on receiving kind=request,
+// call pi.sendUserMessage to inject the task into the current session → genuinely "activating" this agent.
+// Plain messages are not injected, only notified; only request triggers active handling.
 let api: ExtensionAPI | null = null;
 
 export default function (pi: ExtensionAPI) {
   api = pi;
   pi.on("session_start", async (_event, ctx) => {
-    if (!ctx.hasUI) return; // 仅在交互式 TUI 会话激活（避免 fork/子会话起多余服务）
+    if (!ctx.hasUI) return; // only activate in interactive TUI sessions (avoids spare services in forks/sub-sessions)
     state.lastCtx = ctx;
     const loaded = loadConfig(ctx.cwd);
     if (loaded) {
@@ -299,8 +299,8 @@ export default function (pi: ExtensionAPI) {
       "Use a2a_send to start a conversation or ask another agent a question about the code.",
       "Find available recipients first with a2a_peers; the 'to' field is a peer_name or '*' for broadcast.",
       "Put the actual code/question in 'body'; keep 'subject' short.",
-      "局域网 P2P：对方离线时消息会进本地发件箱，对方上线自动送达，无需同时在线。",
-      "kind=request 会主动调动对方：消息送达后会被注入对方当前会话，对方 agent 会立即着手处理并回复——用于委派任务，不要用于闲聊。",
+      "LAN P2P: messages to an offline peer go to the local outbox and are delivered automatically when the peer comes online; no need to be online simultaneously.",
+      "kind=request actively activates the recipient: once delivered it is injected into their current session and their agent starts working on it and replies — use it to delegate tasks, not for small talk.",
     ],
     parameters: Type.Object({
       to: Type.String({ description: "Recipient agent peer_name, or '*' to broadcast to all agents" }),
@@ -308,7 +308,7 @@ export default function (pi: ExtensionAPI) {
       body: Type.String({ description: "Full message body — can include code, questions, explanations" }),
       kind: StringEnum(["message", "request", "result"] as const, {
         description:
-          "message=普通对话(仅通知收件人，不主动触发处理); request=任务请求(收件人 agent 会被主动注入其当前会话立即处理，处理完用 a2a_reply 回 result); result=交付被请求的结果(同样会自动注入收件人当前会话，使其无需手动 a2a_read 即可接收)",
+          "message=ordinary conversation (notifies the recipient only, does not trigger handling); request=task request (the recipient's agent is injected into its current session and handles it immediately, then returns a result via a2a_reply); result=delivery of a requested result (also auto-injected into the recipient's current session so they receive it without a manual a2a_read)",
       }),
     }),
     async execute(_id, params, _signal, onUpdate) {
@@ -333,19 +333,19 @@ export default function (pi: ExtensionAPI) {
       };
       state.store.addMessage(msg);
       state.store.persist();
-      onUpdate?.(textResult(`发送给 ${params.to}…`));
+      onUpdate?.(textResult(`Sending to ${params.to}…`));
       const result = await state.net.deliver(msg);
       state.store.persist();
 
-      const who = params.to === "*" ? "所有人(broadcast)" : params.to;
-      let text = `✅ 已发送给 ${who}\n   线程: ${msg.thread_id}\n   消息ID: ${msg.id}`;
+      const who = params.to === "*" ? "everyone (broadcast)" : params.to;
+      let text = `✅ Sent to ${who}\n   thread: ${msg.thread_id}\n   message id: ${msg.id}`;
       if (params.to === "*") {
-        if (result.delivered.length) text += `\n   已送达: ${result.delivered.join(", ") || "（无在线 peer）"}`;
-        if (result.failed.length) text += `\n   ⚠️ 未送达: ${result.failed.join(", ")}`;
+        if (result.delivered.length) text += `\n   delivered: ${result.delivered.join(", ") || "(no peers online)"}`;
+        if (result.failed.length) text += `\n   ⚠️ not delivered: ${result.failed.join(", ")}`;
       } else if (result.delivered.length) {
-        text += `\n   已送达`;
+        text += `\n   delivered`;
       } else if (result.queued.length) {
-        text += `\n   ⏳ ${params.to} 当前离线，已进入发件箱，对方上线后自动送达`;
+        text += `\n   ⏳ ${params.to} is currently offline; queued in the outbox and will be delivered when they come online`;
       }
       return textResult(text);
     },
@@ -370,14 +370,14 @@ export default function (pi: ExtensionAPI) {
       if (!state.config || !state.store) return textResult(notReady());
       const me = state.config.peerName;
       const msgs = state.store.getInbox(me, { unread: !!params.unread, limit: params.limit ?? 20 });
-      if (msgs.length === 0) return textResult("📭 收件箱为空");
+      if (msgs.length === 0) return textResult("📭 inbox is empty");
       const lines = msgs.map((m) => {
         const tag = state.store!.isRead(m.id, me) ? "○" : "●";
-        const subj = m.subject ? `「${m.subject}」` : "「(无主题)」";
+        const subj = m.subject ? `"${m.subject}"` : '"(no subject)"';
         const preview = m.body.replace(/\s+/g, " ").slice(0, 60);
         return `${tag} [${m.id}] ${m.from_name} → ${subj} ${preview}`;
       });
-      return textResult(`📨 收件箱 (${msgs.length}):\n` + lines.join("\n"));
+      return textResult(`📨 inbox (${msgs.length}):\n` + lines.join("\n"));
     },
   });
 
@@ -401,10 +401,10 @@ export default function (pi: ExtensionAPI) {
       if (!state.config || !state.store) return textResult(notReady());
       const me = state.config.peerName;
       const wholeThread = params.thread !== false;
-      // deep 版本：主 db miss → 扫 archive，保证历史消息（已归档）也能读回。
-      // getInbox 绝不调 deep（高频性能红线）；a2a_read 是低频主动阅读，可接受扫描开销。
+      // deep variant: on a main-db miss → scan the archive so historical (archived) messages remain readable.
+      // getInbox never uses deep (hot-path performance limit); a2a_read is low-frequency manual reading where scan cost is acceptable.
       const threadMsgs = state.store.getThreadDeep(params.message_id);
-      if (threadMsgs.length === 0) return textResult("未找到该消息");
+      if (threadMsgs.length === 0) return textResult("message not found");
 
       const shown = wholeThread ? threadMsgs : threadMsgs.filter((m) => m.id === params.message_id);
       const target = shown.length ? shown : threadMsgs;
@@ -413,7 +413,7 @@ export default function (pi: ExtensionAPI) {
         return `[${t}] ${m.from_name} → ${m.to_name} ${m.subject ? `「${m.subject}」` : ""} (${m.kind})\n${m.body}`;
       });
 
-      // 标记已读（per-reader）
+      // mark as read (per-reader)
       if (wholeThread) state.store.markThreadRead(threadMsgs[0].thread_id, me);
       else state.store.markRead(params.message_id, me);
       state.store.persist();
@@ -443,13 +443,13 @@ export default function (pi: ExtensionAPI) {
       if (!orig) {
         return {
           content: [
-            { type: "text", text: "❌ 找不到原消息，无法确定回复对象（本地没有该消息副本）" },
+            { type: "text", text: "❌ Original message not found; cannot determine the reply target (no local copy of that message)" },
           ],
           details: {}
         };
       }
-      // 分支 A：回复的是我收到的 request（我作为 A2A server 持有 WORKING task）
-      // → 完结 task + 经 push 把结果即时回给请求方（不主动发新消息）
+      // Branch A: replying to a request I received (I hold a WORKING task as the A2A server)
+      // → complete the task + push the result back to the requester immediately (without sending a new message)
       const workingTask = state.store.getWorkingInboundTaskByMsgId(params.message_id);
       if (workingTask) {
         const subject = orig.subject
@@ -457,7 +457,7 @@ export default function (pi: ExtensionAPI) {
             ? orig.subject
             : `Re: ${orig.subject}`
           : "";
-        // 本地留一份 sent(result) 让线程完整
+        // keep a local sent(result) copy so the thread stays complete
         const sent: Message = {
           id: genMsgId(),
           thread_id: orig.thread_id,
@@ -476,7 +476,7 @@ export default function (pi: ExtensionAPI) {
         };
         state.store.addMessage(sent);
         state.store.persist();
-        onUpdate?.(textResult(`完结任务并回结果给 ${orig.from_name}…`));
+        onUpdate?.(textResult(`Completing task and returning result to ${orig.from_name}…`));
         const ok = await state.net.completeInboundTask(params.message_id, params.body);
         state.store.persist();
         return {
@@ -484,16 +484,16 @@ export default function (pi: ExtensionAPI) {
             {
               type: "text",
               text: ok
-                ? `✅ 已交付结果给 ${orig.from_name}（task ${workingTask.taskId} 完成，经 push 即时送达）`
-                : `⚠️ 任务完结异常（task ${workingTask.taskId}），请检查`,
+                ? `✅ Delivered result to ${orig.from_name} (task ${workingTask.taskId} complete, pushed immediately)`
+                : `⚠️ Task completion failed (task ${workingTask.taskId}); please check`,
             },
           ],
           details: {}
         };
       }
 
-      // 分支 B：普通回复（原消息非 request / 已完结 / 是闲聊）→ 发新消息
-      const recipient = orig.from_name; // 回复给原消息发送者
+      // Branch B: ordinary reply (original was not a request / already complete / plain chat) → send a new message
+      const recipient = orig.from_name; // reply to the original sender
       const subject = orig.subject
         ? orig.subject.startsWith("Re:")
           ? orig.subject
@@ -508,17 +508,17 @@ export default function (pi: ExtensionAPI) {
         to_name: recipient,
         subject,
         body: params.body,
-        // 回复 request → 交付 result，语义闭环；其余保持 message。
+        // replying to a request → deliver a result, closing the semantics; otherwise keep it a message.
         kind: orig.kind === "request" ? "result" : "message",
         direction: "sent",
         created_at: nowSec(),
       };
       state.store.addMessage(msg);
       state.store.persist();
-      onUpdate?.(textResult(`回复给 ${recipient}…`));
+      onUpdate?.(textResult(`Replying to ${recipient}…`));
       await state.net.deliver(msg);
       state.store.persist();
-      return textResult(`✅ 已回复 ${recipient}（线程 ${msg.thread_id}）`);
+      return textResult(`✅ Replied to ${recipient} (thread ${msg.thread_id})`);
     },
   });
 
@@ -531,7 +531,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "List online agents and their roles",
     promptGuidelines: [
       "Use a2a_peers to find who you can message; valid 'to' names come from here.",
-      "局域网 P2P：只显示 mDNS 发现到的、同一 workspace 的 peer；确保对方已 /a2a-setup 且在同一局域网。",
+      "LAN P2P: shows only mDNS-discovered peers in the same workspace; make sure the peer has run /a2a-setup and is on the same LAN.",
     ],
     parameters: Type.Object({
       all: Type.Optional(Type.Boolean({ description: "Include offline agents too (default false)" })),
@@ -546,7 +546,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `🤷 当前${params.all ? "已知" : "在线"}没有其他 agent（你是 ${me}）。让对方也跑 /a2a-setup 加入同一个 workspace + 密钥，并确保同一局域网、已安装 bonjour-service。`,
+              text: `🤷 No other agents ${params.all ? "known" : "online"} right now (you are ${me}). Have the peer run /a2a-setup to join the same workspace + secret, and ensure the same LAN and an installed bonjour-service.`,
             },
           ],
           details: {}
@@ -578,7 +578,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params) {
       const ctx = state.lastCtx;
-      if (!ctx) return textResult("⚠️ 会话上下文不可用（session context unavailable）。");
+      if (!ctx) return textResult("⚠️ Session context unavailable.");
       try {
         if (params.name) ctx.setSessionName?.(params.name);
         // Session id/file live on the read-only session manager, not on ctx itself.
@@ -597,7 +597,7 @@ export default function (pi: ExtensionAPI) {
           details: { sessionId: sessionId ?? null, sessionName: sessionName ?? null },
         };
       } catch (e) {
-        return textResult(`⚠️ 无法读取会话: ${e instanceof Error ? e.message : String(e)}`);
+        return textResult(`⚠️ Could not read session: ${e instanceof Error ? e.message : String(e)}`);
       }
     },
   });
@@ -631,9 +631,9 @@ export default function (pi: ExtensionAPI) {
           params.remotePath ?? params.path,
           params.overwrite === true,
         );
-        return textResult(`✅ 已发送 ${params.to}:\n  path: ${res.path}\n  bytes: ${res.bytes}\n  sha256: ${res.sha256}`);
+        return textResult(`✅ Sent to ${params.to}:\n  path: ${res.path}\n  bytes: ${res.bytes}\n  sha256: ${res.sha256}`);
       } catch (e) {
-        return textResult(`⚠️ a2a_put 失败: ${e instanceof Error ? e.message : String(e)}`);
+        return textResult(`⚠️ a2a_put failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     },
   });
@@ -666,9 +666,9 @@ export default function (pi: ExtensionAPI) {
           params.localPath ?? params.path,
           params.overwrite === true,
         );
-        return textResult(`✅ 已从 ${params.from} 取回:\n  path: ${res.path}\n  bytes: ${res.bytes}\n  sha256: ${res.sha256}`);
+        return textResult(`✅ Fetched from ${params.from}:\n  path: ${res.path}\n  bytes: ${res.bytes}\n  sha256: ${res.sha256}`);
       } catch (e) {
-        return textResult(`⚠️ a2a_get 失败: ${e instanceof Error ? e.message : String(e)}`);
+        return textResult(`⚠️ a2a_get failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     },
   });
@@ -685,7 +685,7 @@ export default function (pi: ExtensionAPI) {
     async execute() {
       if (!state.config) return textResult(notReady());
       const root = resolveFileRoot((state.config as any).fileRoot);
-      return textResult(`📁 a2a file root: ${root}\n（a2a_put / a2a_get 的所有路径都相对于此目录）`);
+      return textResult(`📁 a2a file root: ${root}\n(all a2a_put / a2a_get paths are relative to this directory)`);
     },
   });
 
@@ -710,7 +710,7 @@ export default function (pi: ExtensionAPI) {
       const entry = state.store.memSetLocal(params.key, params.value, me);
       state.store.persist();
       state.net?.broadcastMemUpdate(params.key, entry);
-      return textResult(`✅ 已设置共享记忆「${params.key}」（${params.value.length} 字符，已广播给在线 peer）`);
+      return textResult(`✅ Shared memory "${params.key}" set (${params.value.length} chars, broadcast to online peers)`);
     },
   });
 
@@ -728,7 +728,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params) {
       if (!state.config || !state.store) return textResult(notReady());
       const e = state.store.memGet(params.key);
-      if (!e) return textResult(`🤷 共享记忆「${params.key}」不存在（或已被删除）`);
+      if (!e) return textResult(`🤷 Shared memory "${params.key}" does not exist (or was deleted)`);
       const when = new Date(e.ts).toLocaleString();
       return textResult(`📦 ${params.key}（by @${e.author} @ ${when}）:\n${e.value}`);
     },
@@ -745,8 +745,8 @@ export default function (pi: ExtensionAPI) {
     async execute() {
       if (!state.config || !state.store) return textResult(notReady());
       const keys = state.store.memKeys();
-      if (keys.length === 0) return textResult("📭 共享记忆为空");
-      return textResult(`🗝️ 共享记忆 (${keys.length}):\n${keys.map((k) => `- ${k}`).join("\n")}`);
+      if (keys.length === 0) return textResult("📭 shared memory is empty");
+      return textResult(`🗝️ shared memory (${keys.length}):\n${keys.map((k) => `- ${k}`).join("\n")}`);
     },
   });
 
@@ -767,42 +767,42 @@ export default function (pi: ExtensionAPI) {
       const entry = state.store.memDeleteLocal(params.key, me);
       state.store.persist();
       state.net?.broadcastMemUpdate(params.key, entry);
-      return textResult(`🗑️ 已删除共享记忆「${params.key}」（tombstone 已广播）`);
+      return textResult(`🗑️ Shared memory "${params.key}" deleted (tombstone broadcast)`);
     },
   });
 
   // ── Command: /a2a-setup ───────────────────────────────────
   pi.registerCommand("a2a-setup", {
-    description: "配置 pi-a2a（工作区/密钥/agent 身份）",
+    description: "Configure pi-a2a (workspace / secret / agent identity)",
     handler: async (_args, ctx) => {
       if (!ctx.hasUI) {
-        ctx.ui.notify("a2a-setup 需要在 TUI 中运行", "warning");
+        ctx.ui.notify("a2a-setup must run inside the TUI", "warning");
         return;
       }
-      const workspace = (await ctx.ui.input("工作区名称（同一团队的 agent 用同一个名字）", "my-team"))?.trim();
+      const workspace = (await ctx.ui.input("Workspace name (agents on the same team share one name)", "my-team"))?.trim();
       if (!workspace) {
-        ctx.ui.notify("已取消", "info");
+        ctx.ui.notify("Cancelled", "info");
         return;
       }
       const workspaceSecret = (
-        await ctx.ui.input("共享密钥（同一工作区所有 agent 必须相同；用于局域网内互验）", "")
+        await ctx.ui.input("Shared secret (must be identical for all agents in the workspace; used for LAN mutual authentication)", "")
       )?.trim();
       if (!workspaceSecret) {
-        ctx.ui.notify("需要共享密钥", "warning");
+        ctx.ui.notify("A shared secret is required", "warning");
         return;
       }
-      const peerName = (await ctx.ui.input("你的 agent 名字（如 backend / frontend / reviewer）", ""))?.trim();
+      const peerName = (await ctx.ui.input("Your agent name (e.g. backend / frontend / reviewer)", ""))?.trim();
       if (!peerName) {
-        ctx.ui.notify("需要 agent 名字", "warning");
+        ctx.ui.notify("An agent name is required", "warning");
         return;
       }
-      const role = (await ctx.ui.input("角色/能力（可选，如 写API / 写前端 / 审查）", ""))?.trim();
+      const role = (await ctx.ui.input("Role / capability (optional, e.g. API / frontend / review)", ""))?.trim();
 
-      const injectChoice = await ctx.ui.select("收到普通消息时怎么处理？", [
-        "只通知（默认）—— 弹 toast，手动 a2a_inbox/read 查看",
-        "自动读并处理 —— 收到即注入当前会话",
+      const injectChoice = await ctx.ui.select("How should plain messages be handled?", [
+        "Notify only (default) — show a toast; inspect manually with a2a_inbox/read",
+        "Auto-read and handle — inject into the current session on arrival",
       ]);
-      const autoInjectMessage = injectChoice?.startsWith("自动读") === true;
+      const autoInjectMessage = injectChoice?.startsWith("Auto-read") === true;
 
       const cfg: A2aConfig = {
         workspace,
@@ -813,21 +813,21 @@ export default function (pi: ExtensionAPI) {
         autoInjectMessage,
       };
       const fp = saveConfig(ctx.cwd, cfg);
-      ctx.ui.notify(`✅ 已保存配置: ${fp}`, "info");
+      ctx.ui.notify(`✅ Configuration saved: ${fp}`, "info");
 
-      // 激活：先停旧引擎，再用新配置启动
+      // activate: stop the old engine first, then start with the new config
       await stopEngine();
       state.config = cfg;
       state.configPath = fp;
       state.lastCtx = ctx;
       await startEngine(ctx);
-      ctx.ui.notify(`🎉 pi-a2a 已就绪！工作区「${workspace}」· 你是 ${peerName}`, "info");
+      ctx.ui.notify(`🎉 pi-a2a is ready! workspace "${workspace}" · you are ${peerName}`, "info");
     },
   });
 
   // ── Command: /a2a ─────────────────────────────────────────
   pi.registerCommand("a2a", {
-    description: "显示 pi-a2a 状态（收件箱 + 在线 agent）",
+    description: "Show pi-a2a status (inbox + online agents)",
     handler: async (_args, ctx) => {
       if (!state.config || !state.net || !state.store) {
         ctx.ui.notify(NO_CONFIG_MSG, "warning");
@@ -838,48 +838,48 @@ export default function (pi: ExtensionAPI) {
       const peers = state.net.getOnlinePeers().filter((p) => p.peerName !== me);
       const peersTxt =
         peers.map((p) => `🟢 ${p.peerName}${p.role ? `·${p.role}` : ""}`).join("\n  ") ||
-        "（无其他在线 agent）";
-      ctx.ui.notify(`pi-a2a · ${me}\n📨 ${state.unread} 条未读\n在线:\n  ${peersTxt}`, "info");
+        "(no other agents online)";
+      ctx.ui.notify(`pi-a2a · ${me}\n📨 ${state.unread} unread\nOnline:\n  ${peersTxt}`, "info");
     },
   });
 
   // ── Command: /a2a-clear ───────────────────────────────────
   pi.registerCommand("a2a-clear", {
-    description: "清空收件箱（仅主 db 的 inbox 消息；归档与发件历史不动）",
+    description: "Clear the inbox (main-db inbox messages only; archive and sent history untouched)",
     handler: async (_args, ctx) => {
       if (!state.config || !state.store) {
         ctx.ui.notify(NO_CONFIG_MSG, "warning");
         return;
       }
       if (!ctx.hasUI) {
-        ctx.ui.notify("a2a-clear 需要在 TUI 中运行", "warning");
+        ctx.ui.notify("a2a-clear must run inside the TUI", "warning");
         return;
       }
       const me = state.config.peerName;
       const inbox = state.store.getInbox(me, { limit: 999999 });
       if (inbox.length === 0) {
-        ctx.ui.notify("📭 收件箱已空，无需清理", "info");
+        ctx.ui.notify("📭 Inbox already empty; nothing to clear", "info");
         return;
       }
       const unread = state.store.unreadCount(me);
       const confirm = await ctx.ui.select(
-        `确认清空收件箱？将删除 ${inbox.length} 条消息（其中 ${unread} 条未读）。归档与发件历史不受影响。`,
-        ["确认清空", "取消"],
+        `Clear the inbox? This deletes ${inbox.length} messages (${unread} unread). Archive and sent history are unaffected.`,
+        ["Clear", "Cancel"],
       );
-      if (confirm !== "确认清空") {
-        ctx.ui.notify("已取消", "info");
+      if (confirm !== "Clear") {
+        ctx.ui.notify("Cancelled", "info");
         return;
       }
       const removed = state.store.clearInbox();
       state.store.persist();
       recalcUnread();
-      ctx.ui.notify(`🗑️ 已清空收件箱，删除 ${removed} 条消息`, "info");
+      ctx.ui.notify(`🗑️ Inbox cleared; deleted ${removed} messages`, "info");
     },
   });
 
   // ── Command: /a2a-send ────────────────────────────────────
   pi.registerCommand("a2a-send", {
-    description: "直接给其他 agent 发消息（不经过 AI）。用法: /a2a-send <peer> <消息> 或 /a2a-send 交互式",
+    description: "Send a message to another agent directly (bypassing the AI). Usage: /a2a-send <peer> <message> or /a2a-send interactively",
     handler: async (args, ctx) => {
       if (!state.config || !state.store || !state.net) {
         ctx.ui.notify(notReady(), "warning");
@@ -892,37 +892,37 @@ export default function (pi: ExtensionAPI) {
 
       const trimmed = (args ?? "").trim();
       if (trimmed) {
-        // /a2a-send <peer> <body...>  —— 第一个空格前是 peer，其后全部是消息内容
+        // /a2a-send <peer> <body...>  —— before the first space is the peer; everything after is the message body
         const sp = trimmed.indexOf(" ");
         if (sp === -1) {
-          ctx.ui.notify("用法: /a2a-send <peer> <消息内容>（peer 后空格接内容）", "warning");
+          ctx.ui.notify("Usage: /a2a-send <peer> <message> (space after the peer, then the body)", "warning");
           return;
         }
         to = trimmed.slice(0, sp).replace(/^@/, "");
         body = trimmed.slice(sp + 1).trim();
       } else {
-        // 无参数 → 交互式选 peer + 输入主题/内容
+        // no arguments → interactively pick a peer + enter subject/body
         if (!ctx.hasUI) {
-          ctx.ui.notify("a2a-send 交互式需在 TUI 中运行，或用 /a2a-send <peer> <消息>", "warning");
+          ctx.ui.notify("Interactive a2a-send requires the TUI, or use /a2a-send <peer> <message>", "warning");
           return;
         }
         const peers = state.net.getOnlinePeers().filter((p) => p.peerName !== cfg.peerName);
         if (peers.length === 0) {
-          ctx.ui.notify("🤷 当前没有在线 agent（可 /a2a 查看）", "warning");
+          ctx.ui.notify("🤷 No agents online right now (try /a2a)", "warning");
           return;
         }
-        const picked = await ctx.ui.select("发给谁？", peers.map((p) => p.peerName));
+        const picked = await ctx.ui.select("Send to whom?", peers.map((p) => p.peerName));
         if (!picked) {
-          ctx.ui.notify("已取消", "info");
+          ctx.ui.notify("Cancelled", "info");
           return;
         }
         to = picked;
-        subject = (await ctx.ui.input("主题（可选，回车跳过）", ""))?.trim() || "";
-        body = (await ctx.ui.input("消息内容", ""))?.trim() || "";
+        subject = (await ctx.ui.input("Subject (optional, Enter to skip)", ""))?.trim() || "";
+        body = (await ctx.ui.input("Message body", ""))?.trim() || "";
       }
 
       if (!body) {
-        ctx.ui.notify("消息内容为空，已取消", "warning");
+        ctx.ui.notify("Message body is empty; cancelled", "warning");
         return;
       }
 
@@ -945,17 +945,17 @@ export default function (pi: ExtensionAPI) {
       const result = await state.net.deliver(msg);
       state.store.persist();
 
-      let text = `✅ 已发送给 ${to === "*" ? "所有人" : to}`;
-      if (result.delivered.length) text += "（已送达）";
-      else if (result.queued.length) text += "（⏳ 对方离线，进发件箱，上线自动送达）";
-      else if (result.failed.length) text += "（⚠️ 未送达）";
+      let text = `✅ Sent to ${to === "*" ? "everyone" : to}`;
+      if (result.delivered.length) text += " (delivered)";
+      else if (result.queued.length) text += " (⏳ peer offline; queued in the outbox, delivered automatically when online)";
+      else if (result.failed.length) text += " (⚠️ not delivered)";
       ctx.ui.notify(text, "info");
     },
   });
 
   // ── Command: /a2a-inbox ───────────────────────────────────
   pi.registerCommand("a2a-inbox", {
-    description: "查看收件箱（不经过 AI）。用法: /a2a-inbox [unread|<msg_id>]",
+    description: "View the inbox (bypassing the AI). Usage: /a2a-inbox [unread|<msg_id>]",
     handler: async (args, ctx) => {
       if (!state.config || !state.store) {
         ctx.ui.notify(NO_CONFIG_MSG, "warning");
@@ -964,11 +964,11 @@ export default function (pi: ExtensionAPI) {
       const me = state.config.peerName;
       const trimmed = (args ?? "").trim();
 
-      // /a2a-inbox <msg_id>  → 读取完整消息 + 标记已读
-      if (trimmed && trimmed !== "unread" && trimmed !== "未读") {
+      // /a2a-inbox <msg_id>  → read the full message + mark as read
+      if (trimmed && trimmed !== "unread") {
         const threadMsgs = state.store.getThreadDeep(trimmed);
         if (threadMsgs.length === 0) {
-          ctx.ui.notify(`未找到消息 ${trimmed}`, "warning");
+          ctx.ui.notify(`Message not found: ${trimmed}`, "warning");
           return;
         }
         const lines = threadMsgs.map((m) => {
@@ -982,39 +982,39 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // /a2a-inbox [unread]  → 列表
-      const unreadOnly = trimmed === "unread" || trimmed === "未读";
+      // /a2a-inbox [unread]  → list
+      const unreadOnly = trimmed === "unread";
       const msgs = state.store.getInbox(me, { unread: unreadOnly, limit: 20 });
       if (msgs.length === 0) {
-        ctx.ui.notify(unreadOnly ? "📭 没有未读消息" : "📭 收件箱为空", "info");
+        ctx.ui.notify(unreadOnly ? "📭 No unread messages" : "📭 Inbox is empty", "info");
         return;
       }
       const totalUnread = state.store.unreadCount(me);
       const lines = msgs.map((m) => {
         const tag = state.store!.isRead(m.id, me) ? "○" : "●";
-        const subj = m.subject ? `「${m.subject}」` : "「(无主题)」";
+        const subj = m.subject ? `"${m.subject}"` : '"(no subject)"';
         const preview = m.body.replace(/\s+/g, " ").slice(0, 60);
         return `${tag} [${m.id}] ${m.from_name} → ${subj} ${preview}`;
       });
-      const header = `📨 收件箱 (${msgs.length}${unreadOnly ? " 未读" : ""} · 共 ${totalUnread} 未读)`;
+      const header = `📨 inbox (${msgs.length}${unreadOnly ? " unread" : ""} · ${totalUnread} unread total)`;
       ctx.ui.notify(`${header}\n` + lines.join("\n"), "info");
     },
   });
 
   // ── Command: /a2a-peers ───────────────────────────────────
   pi.registerCommand("a2a-peers", {
-    description: "查看在线 agent（不经过 AI）。用法: /a2a-peers [all]",
+    description: "View online agents (bypassing the AI). Usage: /a2a-peers [all]",
     handler: async (args, ctx) => {
       if (!state.config || !state.net) {
         ctx.ui.notify(NO_CONFIG_MSG, "warning");
         return;
       }
       const me = state.config.peerName;
-      const includeAll = (args ?? "").trim() === "all" || (args ?? "").trim() === "全部";
+      const includeAll = (args ?? "").trim() === "all";
       const peers = includeAll ? state.net.getPeers() : state.net.getOnlinePeers();
       const others = peers.filter((p) => p.peerName !== me);
       if (others.length === 0) {
-        ctx.ui.notify(`🤷 当前${includeAll ? "已知" : "在线"}没有其他 agent`, "info");
+        ctx.ui.notify(`🤷 No other agents ${includeAll ? "known" : "online"} right now`, "info");
         return;
       }
       const lines = others.map((p) => {
@@ -1023,8 +1023,8 @@ export default function (pi: ExtensionAPI) {
       });
       const onlineCount = others.filter((p) => state.net!.isOnline(p.peerName)).length;
       const header = includeAll
-        ? `👥 Agents (${onlineCount} 在线 / ${others.length} 已知)`
-        : `👥 在线 Agents (${others.length})`;
+        ? `👥 Agents (${onlineCount} online / ${others.length} known)`
+        : `👥 Online Agents (${others.length})`;
       ctx.ui.notify(`${header}\n` + lines.join("\n"), "info");
     },
   });
