@@ -106,8 +106,62 @@ Config is saved **per-project** to `.pi/pi-a2a.json` (there is no global config)
 | `a2a_read` | Read full message body by id (any message in a thread), marks as read |
 | `a2a_reply` | Reply in a thread (recipient auto-detected; accepts any message id) |
 | `a2a_peers` | List online agents and their roles |
+| `a2a_mem_set` / `a2a_mem_get` / `a2a_mem_keys` / `a2a_mem_delete` | Workspace shared memory (KV, replicated to peers) |
 
 Tool signatures are unchanged from the previous (server-backed) version — only the implementation moved to P2P.
+
+## Bundled skills
+
+The package ships skills under `skills/`; pi loads them automatically once the
+package is installed, on every peer.
+
+| Skill | Purpose |
+|-------|---------|
+| `pi-a2a` | General agent-to-agent messaging: send/reply in threads, shared memory, when to use the channel. |
+| `remote-exec` | Run a command/script/query on **another host** and get its output back over the a2a channel — no SSH, no shared filesystem. |
+
+### remote-exec — cross-host command delegation
+
+Use this when a task needs the OS, network, filesystem, or hardware of another
+agent (e.g. Linux-only tools, a headless server, a different machine's data).
+It is plain a2a delegation, just with a defined message contract:
+
+1. **Caller** discovers peers with `a2a_peers`, then sends a `kind=request`
+   message whose subject starts with `exec:` and whose body contains a fenced
+   `sh` block. In prose, the body looks like:
+
+       Run this on your host and reply with the result.
+
+       ```sh
+       uname -a
+       ```
+
+   ...sent as:
+
+       a2a_send(to="plaz", subject="exec: uname -a",
+                kind="request", body="<the text above>")
+
+2. **Remote agent** runs the command with its own `bash` tool and replies with
+   `a2a_reply(message_id, body=<result>)`. The reply body is a machine-readable
+   block — nothing else:
+
+       host: plaz
+       exit: 0
+       stdout:
+       Linux plaz 7.0.0-34-generic #34-Ubuntu SMP x86_64 GNU/Linux
+       stderr:
+
+3. **Caller** receives the pushed `result` (auto-injected), parses
+   `host`/`exit`/`stdout`/`stderr`, verifies `host` matches the peer it asked,
+   and treats non-zero `exit` (including `-1`) as failure.
+
+The skill covers the request/reply conventions, the exact reply format,
+truncation rules, and safety guidance (non-interactive commands only; no
+credentials over the plaintext LAN channel; only delegate to trusted peers).
+
+> The remote host executes the command itself — requests are never forwarded
+> onward. As with all pi-a2a traffic, holders of the workspace secret are fully
+> trusted, so only delegate to peers you trust.
 
 ## Commands
 

@@ -64,20 +64,32 @@ body clearly asks you to run a command):
 4. Do not editorialise; report the raw result. If the command failed, say so
    and include stderr.
 
-### Reply format (remote agent must use this)
+### Reply format (remote agent MUST use this exactly)
 
-Use this exact shape so the caller can parse it:
+Your reply body must be **only** the following block, with no prose before or
+after it. Emit the fields in this order, one per line, using these exact
+lowercase keys and a single space after the colon. Omit nothing.
 
 ```
-host: <your hostname>
-exit: <exit code>
+host: <your hostname> <-- exactly one line; no spaces in the value>
+exit: <integer exit code, or -1 if you did not run the command>
 stdout:
-<verbatim stdout, trimmed of trailing blank lines>
+<verbatim stdout, trailing blank lines trimmed>
 stderr:
-<verbatim stderr, or empty>
+<verbatim stderr, trailing blank lines trimmed; leave empty if none>
 ```
 
-Example reply body:
+Hard rules:
+- `host:` and `exit:` are each a single line. Do not wrap them.
+- The `stdout:` and `stderr:` keys sit alone on their own line, followed by
+  the captured text on the following lines.
+- Do **not** add commentary, summaries, markdown fences, or reasoning to the
+  body. The caller parses this programmatically.
+- Do **not** prefix values with quotes.
+- If the command produced no stdout, put nothing between `stdout:` and the
+  next key.
+
+Example reply body (this is the entire body):
 
 ```
 host: plaz
@@ -89,19 +101,23 @@ Filesystem      Size  Used Avail Use% Mounted on
 stderr:
 ```
 
-Caveats to include when relevant:
-- If the command was **not** run (unsafe, interactive, missing tool), reply with
-  `exit: -1` and a `stderr:` line explaining why.
-- If output is huge, truncate to a reasonable size and note
-  `stdout: (truncated)`. The 512KB message cap is a hard limit.
+Caveats, still inside the same block:
+- If the command was **not** run (unsafe, interactive, missing tool), set
+  `exit: -1` and put the reason on the `stderr:` lines.
+- If output is huge, truncate it and append a single line `... (truncated)` at
+  the end of the stdout block. The 512KB message cap is a hard limit.
 
 ## Interpreting the result (caller)
 
 - Wait for the pushed `result` (it arrives automatically; you may also see it in
   `a2a_inbox`). It is injected into your session when it arrives.
-- Parse `host`, `exit`, `stdout`, `stderr`. Treat non-zero `exit` as failure.
+- Parse the block by splitting on the first occurrence of each key in order:
+  `host:`, `exit:`, `stdout:`, `stderr:`.
+- Treat a non-zero `exit` (including `-1`) as failure and surface `stderr`.
 - Always verify `host:` matches the peer you asked. Misconfigured peers or a
   broadcast could answer from the wrong host.
+- If the reply does not match the format above, say so and, if needed, re-send
+  the request asking the peer to use the exact format.
 - Report the command and its result to the user, not just the parsed value.
 
 ## Safety rules
