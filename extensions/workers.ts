@@ -655,7 +655,15 @@ export class WorkerManager implements WorkerOps {
       const info: WorkerInfo = { ...existing.info, alive: true };
       if (typeof params?.prompt === "string" && params.prompt.trim()) {
         const r = await this.prompt({ handle: info.handle, message: params.prompt, timeoutMs: params.timeoutMs });
-        return { ...info, reused: true, provision: provisionResult, refreshError, reply: r.reply, elapsedMs: r.elapsedMs };
+        return {
+          ...info,
+          turns: r.turns,
+          reused: true,
+          provision: provisionResult,
+          refreshError,
+          reply: r.reply,
+          elapsedMs: r.elapsedMs,
+        };
       }
       return { ...info, reused: true, provision: provisionResult, refreshError };
     }
@@ -694,6 +702,7 @@ export class WorkerManager implements WorkerOps {
     const result: any = { ...info, alive: true, reused: false, provision: provisionResult, refreshError };
     if (typeof params?.prompt === "string" && params.prompt.trim()) {
       const r = await this.prompt({ handle, message: params.prompt, timeoutMs: params.timeoutMs });
+      result.turns = r.turns;
       result.reply = r.reply;
       result.elapsedMs = r.elapsedMs;
     }

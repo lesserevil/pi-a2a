@@ -111,7 +111,14 @@ async function main(): Promise<void> {
       console.log("\n6. prompt (calls the model)");
       const r = await mgr.prompt({ handle, message: "Reply with exactly: PONG" });
       check("got a reply", typeof r.reply === "string" && r.reply.trim().length > 0, JSON.stringify(r.reply).slice(0, 200));
+      check("turns incremented", r.turns >= 1, String(r.turns));
       console.log(`    reply: ${JSON.stringify(r.reply).slice(0, 200)}`);
+
+      console.log("\n6b. open with an initial prompt (reuses the live session)");
+      const o2 = await mgr.open({ path: "clone-a", prompt: "Reply with exactly: PONG-OPEN" });
+      check("open+prompt reply", String(o2.reply).includes("PONG-OPEN"), JSON.stringify(o2.reply));
+      check("open+prompt turns", o2.turns >= 1, String(o2.turns));
+      console.log(`    reply: ${JSON.stringify(o2.reply).slice(0, 120)}`);
     } else {
       console.log("\n6. prompt skipped (set PI_A2A_TEST_PROMPT=1 to enable)");
     }
