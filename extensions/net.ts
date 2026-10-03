@@ -896,6 +896,65 @@ export class Network {
     }
   }
 
+  /** Re-adopt peers that are still advertised over mDNS but are missing from `this.peers`.
+   *
+   *  bonjour-service emits `up` only once per service instance: repeated announcements
+   *  for an unchanged SRV/TXT record only refresh its internal cache, and it never prunes
+   *  that cache (its `expire()` is not wired to a timer, and `lastSeen` on a cached service
+   *  is not updated for unchanged records). So if we evict a peer via PEER_TTL_MS (a blip in
+   *  the health probe, a sleeping advertiser, a NIC change) while the advertiser keeps
+   *  announcing, we never receive another `up` — the peer is lost until it restarts.
+   *
+   *  This walks the browser cache every refresh and health-probes any advertised peer we
+   *  don't currently track. Liveness is confirmed over HTTP, not from the cache, so a stale
+   *  cache entry cannot resurrect an offline peer. */
+  private async reconcileMdnsServices(): Promise<void> {
+    let services: any[] = [];
+    try {
+      services = this.browser?.services ?? [];
+    } catch {
+      return;
+    }
+    for (const svc of services) {
+      const txt = svc?.txt ?? {};
+      if (!wsMatch(txt, this.config)) continue;
+      if (txt.proto !== PROTO) continue;
+      const peerName = String(txt.name ?? svc?.name ?? "");
+      if (!peerName || peerName === this.config.peerName) continue;
+      const port = Number(svc?.port ?? 0);
+      const host = this.pickHost(svc);
+      if (!host || !port) continue;
+
+      const existing = this.peers.get(peerName);
+      if (existing) {
+        // Keep the address in sync if the advertiser moved, but do NOT bump lastSeen
+        // here: the browser cache is never pruned, so that would keep a dead peer alive.
+        if (existing.host !== host || existing.port !== port) {
+          existing.host = host;
+          existing.port = port;
+          this.hooks.onPeersChanged();
+        }
+        continue;
+      }
+
+      const candidate: Peer = {
+        peerName,
+        agentId: String(txt.agent ?? ""),
+        role: String(txt.role ?? ""),
+        host,
+        port,
+        lastSeen: 0,
+      };
+      if (!(await this.healthCheck(candidate))) continue;
+      candidate.lastSeen = Date.now();
+      this.peers.set(peerName, candidate);
+      this.hooks.log?.(`peer online (mDNS resync): ${peerName} (${host}:${port})`);
+      this.hooks.onPeersChanged();
+      void this.flushOutbox(peerName);
+      void this.pullMemSnapshot(peerName);
+    }
+  }
+
   // ── same-host presence fallback discovery ───────────────
   private presenceDir(): string {
     return path.join(os.homedir(), ".pi", "agent", "pi-a2a-presence");
@@ -1030,6 +1089,7 @@ export class Network {
       } catch {
         /* ignore */
       }
+      await this.reconcileMdnsServices();
       await this.probePeers();
       const cutoff = Date.now() - PEER_TTL_MS;
       let changed = false;
