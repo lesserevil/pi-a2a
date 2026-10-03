@@ -14,6 +14,10 @@ The mechanism is ordinary pi-a2a delegation: send a `kind=request` message that
 contains a command, and the remote agent runs it and replies with the result
 (`kind=result`), which is pushed back to you automatically.
 
+> Need several steps, a project checkout, or a persistent session on the other
+> host? Use the [`cluster-workspaces`](../cluster-workspaces/SKILL.md) skill
+> instead: it provisions a working copy and opens a real pi session there.
+
 ## Before you start
 
 1. `a2a_peers` — list online peers. The peer names here are valid `to` targets.

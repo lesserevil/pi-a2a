@@ -110,6 +110,7 @@ Config is saved **per-project** to `.pi/pi-a2a.json` (there is no global config)
 | `a2a_put` | Copy a local file to another agent's sandbox (peer-to-peer, bytes bypass the model) |
 | `a2a_get` | Fetch a file from another agent's sandbox into the local one |
 | `a2a_file_root` | Show the local file sandbox root |
+| `a2a_remote` | Provision a working copy on another host and open/prompt/list/close a pi session rooted inside it (cluster workspaces) |
 | `a2a_mem_set` / `a2a_mem_get` / `a2a_mem_keys` / `a2a_mem_delete` | Workspace shared memory (KV, replicated to peers) |
 
 Tool signatures are unchanged from the previous (server-backed) version — only the implementation moved to P2P.
@@ -142,6 +143,57 @@ large or binary files and has no 512 KB message limit.
 > content inline (or base64), but `a2a_put`/`a2a_get` are the right tool for
 > anything sizable or binary.
 
+## Cluster workspaces & remote sessions
+
+Any peer can ask another host to **provision a working copy** and open a real pi
+**session** rooted inside it, then send work to that session and read the result
+back — with no pre-configured list of projects. This is what lets a cluster of
+hosts hand projects around: *"clone this repo on `savitar` and build it"*,
+*"check out the release branch on `godspeed` and run the tests"*.
+
+All of it goes through one tool, `a2a_remote`:
+
+| `op` | Required | Optional | Effect on the peer |
+|------|----------|----------|--------------------|
+| `provision` | `peer`, `path` | `git`, `ref`, `submodules` | Create the directory; when `git` is given, clone it (or fetch + update an existing checkout) and check out `ref` / init submodules. |
+| `open` | `peer`, `path` | `git`, `ref`, `submodules`, `name`, `model`, `thinking`, `prompt`, `sessionId`, `timeoutMs` | Provision first if `git` is given, then start (or reuse) a pi session rooted at `path`. Returns a `handle`. |
+| `prompt` | `peer`, `handle`, `message` | `timeoutMs` | Send a prompt into the session and return its final assistant text. |
+| `list` | `peer` | — | Show the peer's sessions. |
+| `close` | `peer`, `handle` | — | Dispose the session (kill the worker process). |
+
+`path` may be **any** directory on the peer. Relative paths resolve under the
+peer's `workspaceRoot` (default `~/.pi/a2a-workspaces`); absolute paths are used
+as-is.
+
+```
+a2a_remote(peer="savitar", op="open", path="~/src/widget",
+           git="git@github.com:me/widget.git", ref="main", name="widget-build")
+  → handle: sess_1a2b3c4d   session: 6b836061-...
+
+a2a_remote(peer="savitar", op="prompt", handle="sess_1a2b3c4d",
+           message="Build the project and fix any compile errors in src/.")
+a2a_remote(peer="savitar", op="close", handle="sess_1a2b3c4d")
+```
+
+How it works: the peer spawns a child `pi --mode rpc` process with `cwd` = the
+workspace path and a stable `--session-id`, so its `read`/`bash`/`edit`/`write`
+tools are rooted in the project. The session is **persisted and resumable** — if
+the peer's bridge restarts, the next `prompt` respawns the worker with the same
+session id. Workers run with pi-a2a disabled (`PI_A2A_WORKER=1`) so they never
+join the mesh themselves; only the caller orchestrates. Prompts are serialized
+per session and counted against `workerMaxSessions` (default 8). Interactive
+extension dialogs raised inside a worker are auto-declined, so a worker never
+blocks on a prompt nobody can answer.
+
+A host advertises support by showing `[remote-sessions]` in `a2a_peers`.
+Requires `git` on the worker host's `PATH`.
+
+> **Security:** this is intentionally remote code execution. A peer holding the
+> shared secret can create directories, clone repositories, and run a full agent
+> (with `bash`) as this host's user. Bound it with `allowRemoteWorkspace: false`
+> and/or `workspaceRoots: [...]`, and only run it on trusted LANs. Provisioning
+> never deletes anything and refuses to overwrite a non-empty non-git directory.
+
 ## Bundled skills
 
 The package ships skills under `skills/`; pi loads them automatically once the
@@ -151,6 +203,7 @@ package is installed, on every peer.
 |-------|---------|
 | `pi-a2a` | General agent-to-agent messaging: send/reply in threads, shared memory, when to use the channel. |
 | `remote-exec` | Run a command/script/query on **another host** and get its output back over the a2a channel — no SSH, no shared filesystem. |
+| `cluster-workspaces` | Provision a working copy on another host and open/steer a pi session inside it (clone/update a repo, then send coding work). |
 
 ### remote-exec — cross-host command delegation
 
@@ -282,6 +335,13 @@ New messages trigger a toast notification.
 | `notifyPath` | push-notification webhook receiver path (default `/a2a/notify`) |
 | `pushSweepMs` | push-notification backstop sweep interval (default `15000`) |
 | `pushBackstopMs` | after this long without a push, actively `GetTask` (default `30000`) |
+| `allowRemoteWorkspace` | default `true`; set `false` to refuse all remote workspace/session requests from peers |
+| `workspaceRoot` | base directory for relative remote workspace paths (default `~/.pi/a2a-workspaces`) |
+| `workspaceRoots` | optional allowlist; when set, every remote workspace path must resolve inside one of these roots |
+| `workerProjectTrust` | `"ignore"` (default, spawns workers with `--no-approve`), `"approve"` (`--approve`), or `"default"` |
+| `workerPiBin` | optional explicit `pi` executable used to spawn worker sessions |
+| `workerMaxSessions` | maximum concurrent remote sessions on this host (default `8`) |
+| `workerPromptTimeoutMs` | maximum wall time for a single remote prompt (default `1800000` = 30 min) |
 
 Environment variable references are supported: `"workspaceSecret": "$PI_A2A_SECRET"`.
 
@@ -328,6 +388,10 @@ Each agent exposes a tiny A2A-compliant HTTP server (the sending side is an outb
 | `POST` | `/rpc` | JSON-RPC 2.0 endpoint: `SendMessage`, `GetTask` (validates `Authorization: Bearer <secret>`) |
 | `POST` | `/a2a/notify` | push-notification webhook receiver (validates `X-A2A-Notification-Token` / Bearer) |
 | `GET` | `/health` | Liveness + name/workspace (mDNS keep-alive probe; non-spec) |
+
+In addition to `SendMessage` / `GetTask`, the JSON-RPC endpoint accepts
+`ProvisionWorkspace`, `OpenSession`, `PromptSession`, `ListSessions`, and
+`CloseSession` (the cluster workspace/session operations above).
 
 Bodies are capped at 512KB. Methods are v1.0 PascalCase (`SendMessage`/`GetTask`).
 

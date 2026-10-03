@@ -14,6 +14,7 @@ Use pi-a2a when the user wants to talk to, collaborate with, or discuss code wit
 - The user says "ask the other agent", "have X take a look", or "discuss this with the other terminal"
 - You need to send a code snippet, a design decision, or a question to another agent
 - Another agent has asked you something (you will see an unread-message indicator in the widget)
+- The work needs another host's OS / hardware / repo: use the `cluster-workspaces` skill to provision a working copy and open a session there, or `remote-exec` for a single command
 
 ## Tools
 

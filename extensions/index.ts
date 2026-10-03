@@ -28,6 +28,7 @@ import {
 import { Store, type Message, type MsgKind } from "./store.ts";
 import { Network, type Peer } from "./net.ts";
 import { resolveFileRoot } from "./files.ts";
+import { WorkerManager } from "./workers.ts";
 
 // ── state ───────────────────────────────────────────────────
 
@@ -36,6 +37,7 @@ interface LiveState {
   configPath: string | null;
   store: Store | null;
   net: Network | null;
+  workers: WorkerManager | null;
   unread: number;
   lastCtx: any; // most recent ctx, used for widget redraw / toast
   widgetTimer: ReturnType<typeof setInterval> | null;
@@ -46,6 +48,7 @@ const state: LiveState = {
   configPath: null,
   store: null,
   net: null,
+  workers: null,
   unread: 0,
   lastCtx: null,
   widgetTimer: null,
@@ -147,8 +150,27 @@ async function startEngine(ctx: any): Promise<void> {
   store.startAutoFlush();
   state.store = store;
 
+  // Remote workspaces / sessions (cluster): a peer may ask this host to provision
+  // a working copy and open a pi session inside it. Workers are child pi processes
+  // rooted at the requested path, controlled over JSON-RPC.
+  const workers = new WorkerManager({
+    config: cfg,
+    // scope the worker registry to this project (next to the a2a DB), so two
+    // bridges on one host (different projects) do not clobber each other.
+    registryPath: dbPathFor(ctx.cwd).replace(/pi-a2a\.db\.json$/, "pi-a2a-workers.json"),
+    log: (msg) => {
+      try {
+        console.log(`[pi-a2a] ${msg}`);
+      } catch {
+        /* ignore */
+      }
+    },
+  });
+  state.workers = workers;
+
   const net = new Network(cfg, {
     store,
+    workers,
     onMessageReceived: (m) => {
       recalcUnread();
       try {
@@ -249,6 +271,12 @@ async function stopEngine(): Promise<void> {
     state.widgetTimer = null;
   }
   try {
+    await state.workers?.shutdown();
+  } catch {
+    /* ignore */
+  }
+  state.workers = null;
+  try {
     await state.net?.stop();
   } catch {
     /* ignore */
@@ -271,6 +299,11 @@ async function stopEngine(): Promise<void> {
 let api: ExtensionAPI | null = null;
 
 export default function (pi: ExtensionAPI) {
+  // Worker sessions spawned by another host's pi-a2a must not themselves join the
+  // mesh (that would create a duplicate peer and discovery loops). They run with
+  // PI_A2A_WORKER=1 and pi-a2a is a no-op inside them.
+  if (process.env.PI_A2A_WORKER === "1") return;
+
   api = pi;
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return; // only activate in interactive TUI sessions (avoids spare services in forks/sub-sessions)
@@ -554,7 +587,8 @@ export default function (pi: ExtensionAPI) {
       }
       const lines = others.map((p) => {
         const status = params.all && !state.net!.isOnline(p.peerName) ? "⚪" : "🟢";
-        return `${status} ${p.peerName}${p.role ? ` — ${p.role}` : ""}`;
+        const cap = p.caps?.includes("sessions") ? "  [remote-sessions]" : "";
+        return `${status} ${p.peerName}${p.role ? ` — ${p.role}` : ""}${cap}`;
       });
       return textResult(`👥 Agents:\n` + lines.join("\n"));
     },
@@ -598,6 +632,133 @@ export default function (pi: ExtensionAPI) {
         };
       } catch (e) {
         return textResult(`⚠️ Could not read session: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    },
+  });
+
+  // ── Tool: a2a_remote ────────────────────────────────────
+  pi.registerTool({
+    name: "a2a_remote",
+    label: "A2A Remote Workspace/Session",
+    description:
+      "Provision a working copy on another host and open a real pi session rooted inside it, then send prompts into that session and read the replies. Not limited to pre-configured folders: `path` may be any directory on the peer (relative paths resolve under its workspaceRoot). Ops: provision (git clone/fetch/checkout into `path`), open (create/reuse a session at `path`, optionally provisioning first via `git`/`ref`), prompt (send work into a session `handle` and wait for the final answer), list (show remote sessions), close (dispose a session).",
+    promptSnippet: "Provision a working copy and open/prompt a pi session on another host",
+    promptGuidelines: [
+      "Use a2a_remote when the work must happen on another host (different OS/hardware/repo) and needs its own project checkout and session rather than a one-off command.",
+      "Flow: a2a_remote(op='open', peer, path, git=<url>, ref=<branch>) provisions the checkout and opens a session in one step; then a2a_remote(op='prompt', peer, handle, message) sends work to it; use op='close' when done.",
+      "op='provision' only sets up the working copy; op='open' requires `path`, and provisions first when `git` is given.",
+      "Remote sessions run a full pi agent with file/bash tools rooted at `path`, so prompts can be multi-step coding tasks; the reply is the session's final assistant text.",
+      "The peer must advertise [remote-sessions] in a2a_peers; the shared secret is the only credential, so only target peers you trust.",
+      "For a single command on another host, prefer a remote-exec (a2a_send kind=request, subject 'exec: …') instead of a session.",
+    ],
+    parameters: Type.Object({
+      peer: Type.String({ description: "Target agent peer_name (see a2a_peers)" }),
+      op: StringEnum(["provision", "open", "prompt", "list", "close"] as const, {
+        description:
+          "provision=clone/update a working copy; open=create/reuse a session at path (provisions first if git given); prompt=send a message to a session handle; list=show sessions; close=dispose a session",
+      }),
+      path: Type.Optional(
+        Type.String({
+          description: "Workspace directory on the peer. Relative paths resolve under the peer's workspaceRoot; absolute paths are allowed. Required for provision/open.",
+        }),
+      ),
+      git: Type.Optional(
+        Type.String({ description: "Git remote URL to clone (or fetch if the workspace already exists). Optional for open/provision." }),
+      ),
+      ref: Type.Optional(Type.String({ description: "Branch, tag or commit to check out after clone/fetch" })),
+      submodules: Type.Optional(Type.Boolean({ description: "Run `git submodule update --init --recursive` (default false)" })),
+      name: Type.Optional(Type.String({ description: "Display name for the session (default remote:<dirname>)" })),
+      model: Type.Optional(Type.String({ description: "Optional model pattern for the session (e.g. 'anthropic/*')" })),
+      thinking: Type.Optional(
+        Type.String({ description: "Optional thinking level: off|minimal|low|medium|high|xhigh|max" }),
+      ),
+      handle: Type.Optional(Type.String({ description: "Session handle returned by op=open. Required for prompt/close." })),
+      message: Type.Optional(Type.String({ description: "Prompt text to send into the session. Required for op=prompt." })),
+      prompt: Type.Optional(
+        Type.String({ description: "Optional initial prompt to run immediately after op=open (convenience)." }),
+      ),
+      timeoutMs: Type.Optional(
+        Type.Number({ description: "Optional wall-clock timeout for open/prompt (ms); defaults to the peer's workerPromptTimeoutMs" }),
+      ),
+    }),
+    async execute(_id, params, _signal, onUpdate) {
+      if (!state.config || !state.net) return textResult(notReady());
+      const peer = String(params.peer ?? "").trim();
+      if (!peer) return textResult("❌ a2a_remote requires `peer` (see a2a_peers).");
+      const op = String(params.op ?? "");
+      try {
+        switch (op) {
+          case "provision": {
+            if (!params.path) return textResult("❌ op=provision requires `path`.");
+            onUpdate?.(textResult(`⏳ provisioning ${params.path} on ${peer}…`));
+            const r = await state.net.provisionWorkspace(peer, {
+              path: params.path,
+              git: params.git,
+              ref: params.ref,
+              submodules: params.submodules,
+            });
+            return textResult(
+              `✅ workspace ${r.action} on ${peer}\n   path: ${r.path}\n   head: ${r.head ?? "(n/a)"}\n   branch: ${r.branch || "(n/a)"}`,
+              { peer, ...r },
+            );
+          }
+          case "open": {
+            if (!params.path) return textResult("❌ op=open requires `path`.");
+            onUpdate?.(textResult(`⏳ opening session on ${peer} at ${params.path}…`));
+            const r = await state.net.openSession(peer, {
+              path: params.path,
+              git: params.git,
+              ref: params.ref,
+              submodules: params.submodules,
+              name: params.name,
+              model: params.model,
+              thinking: params.thinking,
+              prompt: params.prompt,
+              timeoutMs: params.timeoutMs,
+            });
+            let text = `✅ session ${r.reused ? "reused" : "opened"} on ${peer}\n   handle: ${r.handle}\n   path: ${r.path}\n   session: ${r.sessionId}\n   name: ${r.name}`;
+            if (r.provision) text += `\n   provision: ${r.provision.action} (head ${r.provision.head ?? "n/a"})`;
+            if (typeof r.reply === "string") text += `\n\n── reply ──\n${r.reply}`;
+            return textResult(text, { peer, ...r });
+          }
+          case "prompt": {
+            if (!params.handle) return textResult("❌ op=prompt requires `handle` (from op=open).");
+            if (!params.message) return textResult("❌ op=prompt requires `message`.");
+            onUpdate?.(textResult(`⏳ prompting session ${params.handle} on ${peer}…`));
+            const r = await state.net.promptSession(peer, {
+              handle: params.handle,
+              message: params.message,
+              timeoutMs: params.timeoutMs,
+            });
+            const secs = typeof r.elapsedMs === "number" ? (r.elapsedMs / 1000).toFixed(1) : "?";
+            return textResult(
+              `✅ ${r.handle} (${r.path}) replied in ${secs}s · turn ${r.turns}\n\n${r.reply || "(empty reply)"}`,
+              { peer, ...r },
+            );
+          }
+          case "list": {
+            const r = await state.net.listSessions(peer);
+            const sessions: any[] = Array.isArray(r.sessions) ? r.sessions : [];
+            if (sessions.length === 0) return textResult(`📭 no remote sessions on ${peer}`);
+            const lines = sessions.map(
+              (s) =>
+                `${s.alive ? "🟢" : "⚪"} ${s.handle} · ${s.path} · name=${s.name} · session=${s.sessionId} · turns=${s.turns}`,
+            );
+            return textResult(`🗂️ remote sessions on ${peer} (${sessions.length}/${r.maxSessions ?? "?"}):\n` + lines.join("\n"), {
+              peer,
+              ...r,
+            });
+          }
+          case "close": {
+            if (!params.handle) return textResult("❌ op=close requires `handle`.");
+            const r = await state.net.closeSession(peer, { handle: params.handle });
+            return textResult(`🗑️ closed ${r.handle} on ${peer} (${r.path})`, { peer, ...r });
+          }
+          default:
+            return textResult(`❌ unknown op: ${op} (expected provision|open|prompt|list|close)`);
+        }
+      } catch (e) {
+        return textResult(`⚠️ a2a_remote ${op} failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     },
   });
@@ -1019,7 +1180,8 @@ export default function (pi: ExtensionAPI) {
       }
       const lines = others.map((p) => {
         const status = includeAll && !state.net!.isOnline(p.peerName) ? "⚪" : "🟢";
-        return `${status} ${p.peerName}${p.role ? ` — ${p.role}` : ""}`;
+        const cap = p.caps?.includes("sessions") ? "  [remote-sessions]" : "";
+        return `${status} ${p.peerName}${p.role ? ` — ${p.role}` : ""}${cap}`;
       });
       const onlineCount = others.filter((p) => state.net!.isOnline(p.peerName)).length;
       const header = includeAll

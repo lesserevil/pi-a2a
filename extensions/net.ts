@@ -36,6 +36,7 @@ import {
   readOutgoingFile,
   DEFAULT_FILE_MAX_BYTES,
 } from "./files.ts";
+import type { WorkerOps } from "./workers.ts";
 
 const nativeRequire = createRequire(import.meta.url);
 
@@ -46,6 +47,7 @@ export interface Peer {
   host: string;
   port: number;
   lastSeen: number; // epoch ms
+  caps?: string; // comma-separated capability markers advertised over mDNS (e.g. "sessions")
 }
 
 export interface DeliverResult {
@@ -58,6 +60,7 @@ export interface NetHooks {
   store: Store;
   onMessageReceived: (m: Message) => void; // new message → toast + (request/result) injection
   onPeersChanged: () => void; // peer online/offline → refresh widget
+  workers?: WorkerOps; // remote workspaces / sessions (cluster); absent → the RPC methods are unavailable
   log?: (msg: string) => void;
 }
 
@@ -85,6 +88,7 @@ export interface PresenceRec {
   proto: string;
   ts: number;
   pid: number;
+  caps?: string; // capability markers (e.g. "sessions")
 }
 
 /**
@@ -310,6 +314,9 @@ export class Network {
     return new Promise((resolve, reject) => {
       this.server = http.createServer((req, res) => this.handle(req, res));
       this.server.on("error", (e) => this.hooks.log?.(`HTTP server error: ${e?.message ?? e}`));
+      // Remote workspace provisioning and prompts are long-running (git clone, LLM runs);
+      // disable the default 5-minute request timeout so those calls are not cut off.
+      this.server.requestTimeout = 0;
       const port = this.config.listenPort ?? 0;
       this.server.listen(port, "0.0.0.0", () => {
         const addr = this.server!.address();
@@ -398,6 +405,17 @@ export class Network {
         return this.handleMemUpdate(params, res, id);
       case "MemSnapshot":
         return this.handleMemSnapshot(res, id);
+      // ── remote workspaces / sessions (cluster) ──
+      case "ProvisionWorkspace":
+        return this.handleWorkerRpc("provision", params, res, id);
+      case "OpenSession":
+        return this.handleWorkerRpc("open", params, res, id);
+      case "PromptSession":
+        return this.handleWorkerRpc("prompt", params, res, id);
+      case "ListSessions":
+        return this.handleWorkerRpc("list", params, res, id);
+      case "CloseSession":
+        return this.handleWorkerRpc("close", params, res, id);
       default:
         return this.rpcJson(res, id, rpcError(id, ERR_METHOD_NOT_FOUND, `Method not found: ${method}`));
     }
@@ -456,6 +474,46 @@ export class Network {
 
     const task = this.buildTask(taskId, contextId, state);
     this.rpcJson(res, id, rpcResult(id, { task }));
+  }
+
+  /** Dispatch a remote workspace/session operation to the local WorkerManager. */
+  private async handleWorkerRpc(
+    op: "provision" | "open" | "prompt" | "list" | "close",
+    params: any,
+    res: http.ServerResponse,
+    id: any,
+  ): Promise<void> {
+    const w = this.hooks.workers;
+    if (!w) {
+      return this.rpcJson(
+        res,
+        id,
+        rpcError(id, ERR_METHOD_NOT_FOUND, `remote workspaces are not available on this agent (${op})`),
+      );
+    }
+    try {
+      let data: any;
+      switch (op) {
+        case "provision":
+          data = await w.provision(params);
+          break;
+        case "open":
+          data = await w.open(params);
+          break;
+        case "prompt":
+          data = await w.prompt(params);
+          break;
+        case "list":
+          data = w.list();
+          break;
+        case "close":
+          data = await w.close(params);
+          break;
+      }
+      this.rpcJson(res, id, rpcResult(id, data));
+    } catch (e) {
+      this.rpcJson(res, id, rpcError(id, ERR_INTERNAL, e instanceof Error ? e.message : String(e)));
+    }
   }
 
   /** GetTask: return local task state (used as the push fallback). */
@@ -577,6 +635,8 @@ export class Network {
         streaming: false,
         pushNotifications: true,
         extendedAgentCard: false,
+        // custom capability marker: this agent can provision workspaces and open/prompt remote sessions
+        workspaceSessions: true,
       },
       securitySchemes: {
         ws: {
@@ -809,6 +869,7 @@ export class Network {
           wsh: wsHash(this.config.workspace, this.config.workspaceSecret), // workspace hash; isolation relies on it
           proto: PROTO,
           a2aver: A2AVER,
+          caps: "sessions", // capability marker: remote workspaces + sessions supported
         },
       });
       this.service?.on?.("error", (e: unknown) => {
@@ -874,6 +935,7 @@ export class Network {
       host,
       port,
       lastSeen: Date.now(),
+      caps: String(txt.caps ?? ""),
     });
     if (isNew) {
       this.hooks.log?.(`peer online: ${peerName} (${host}:${port})`);
@@ -944,6 +1006,7 @@ export class Network {
         host,
         port,
         lastSeen: 0,
+        caps: String(txt.caps ?? ""),
       };
       if (!(await this.healthCheck(candidate))) continue;
       candidate.lastSeen = Date.now();
@@ -980,6 +1043,7 @@ export class Network {
         proto: PROTO,
         ts: Date.now(),
         pid: process.pid,
+        caps: "sessions",
       };
       fs.writeFileSync(this.presenceFile(), JSON.stringify(rec));
     } catch {
@@ -1045,6 +1109,7 @@ export class Network {
         host: "127.0.0.1",
         port,
         lastSeen: Date.now(),
+        caps: String((rec as any).caps ?? ""),
       });
       if (isNew) {
         this.hooks.log?.(`peer online (presence): ${peerName} (127.0.0.1:${port})`);
@@ -1168,6 +1233,37 @@ export class Network {
         /* one peer's delivery failure doesn't affect others; the snapshot heals it when they come online */
       });
     }
+  }
+
+  // ── remote workspaces / sessions (client) ───────────────
+  /** Authenticated JSON-RPC call to a peer with a caller-chosen timeout (these ops run for minutes). */
+  private async callPeer<T = any>(peerName: string, method: string, params: any, timeoutMs: number): Promise<T> {
+    const peer = this.getPeer(peerName);
+    if (!peer) throw new Error(`peer not found: ${peerName}`);
+    if (!this.isOnline(peerName)) throw new Error(`peer offline: ${peerName}`);
+    const j = await this.rpcCall(peer, method, params, timeoutMs);
+    if (j?.error) throw new Error(`${peerName}: ${j.error.message ?? "rpc error"}`);
+    return (j?.result ?? {}) as T;
+  }
+  /** Ask a peer to create/update a working copy (git clone / fetch / checkout). */
+  provisionWorkspace(peerName: string, params: any, timeoutMs = 15 * 60_000): Promise<any> {
+    return this.callPeer(peerName, "ProvisionWorkspace", params, timeoutMs);
+  }
+  /** Ask a peer to open a pi session rooted in a working copy. */
+  openSession(peerName: string, params: any, timeoutMs = 5 * 60_000): Promise<any> {
+    return this.callPeer(peerName, "OpenSession", params, timeoutMs);
+  }
+  /** Send a prompt into a remote session and wait for the final assistant text. */
+  promptSession(peerName: string, params: any, timeoutMs = 30 * 60_000): Promise<any> {
+    return this.callPeer(peerName, "PromptSession", params, timeoutMs);
+  }
+  /** List remote sessions on a peer. */
+  listSessions(peerName: string, timeoutMs = 20_000): Promise<any> {
+    return this.callPeer(peerName, "ListSessions", {}, timeoutMs);
+  }
+  /** Close (dispose) a remote session on a peer. */
+  closeSession(peerName: string, params: any, timeoutMs = 20_000): Promise<any> {
+    return this.callPeer(peerName, "CloseSession", params, timeoutMs);
   }
 
   // ── file transfer ───────────────────────────────────────

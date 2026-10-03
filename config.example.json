@@ -17,5 +17,14 @@
   "pushBackstopMs": 30000,
   "autoInjectMessage": false,
   "fileRoot": "~/.pi/a2a-files",
-  "fileMaxBytes": 67108864
+  "fileMaxBytes": 67108864,
+
+  "_cluster_comment": "Remote workspaces/sessions (cluster): a peer may provision a working copy on this host and open/prompt a pi session inside it. This is remote code execution with this user's permissions — bound it with allowRemoteWorkspace and/or workspaceRoots.",
+  "allowRemoteWorkspace": true,
+  "workspaceRoot": "~/.pi/a2a-workspaces",
+  "workspaceRoots": [],
+  "workerProjectTrust": "ignore",
+  "workerPiBin": "",
+  "workerMaxSessions": 8,
+  "workerPromptTimeoutMs": 1800000
 }
