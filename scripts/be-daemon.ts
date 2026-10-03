@@ -1,15 +1,15 @@
 /**
- * be-daemon.ts — 轻量 BE 守护进程（A2A 版，无需 TUI）
+ * be-daemon.ts — lightweight BE daemon (A2A edition, no TUI required)
  *
- * 目的: 让一个 BE peer 上线，打通 FE↔BE 的 A2A 委派闭环。
- *   - 复用 pi-a2a 的 Network + Store（纯类，不依赖 pi 会话/TUI）
- *   - 起 A2A HTTP server（Agent Card + JSON-RPC /rpc + push webhook /a2a/notify）
- *     + mDNS 广播(proto=a2a) + 写 presence 文件
- *   - FE 的 10s refresh 会扫到 ~/.pi/agent/pi-a2a-presence/be-daemon-001.json → 发现 BE
- *   - 收到 kind=request → 自动完结 task 并经 push 把结果回给 FE（验证双向闭环）
+ * Purpose: bring a BE peer online and exercise the FE↔BE A2A delegation loop.
+ *   - reuses pi-a2a's Network + Store (plain classes, no dependency on a pi session/TUI)
+ *   - starts an A2A HTTP server (Agent Card + JSON-RPC /rpc + push webhook /a2a/notify)
+ *     + mDNS advertising (proto=a2a) + writes a presence file
+ *   - FE's 10s refresh picks up ~/.pi/agent/pi-a2a-presence/be-daemon-001.json → discovers BE
+ *   - on kind=request → completes the task automatically and pushes the result back to FE (verifying the two-way loop)
  *
- * 运行: nohup npx tsx scripts/be-daemon.ts > /tmp/pi-a2a-be-daemon.log 2>&1 &
- * 停止: pkill -f be-daemon.ts  (或读 /tmp/pi-a2a-be-daemon.pid kill)
+ * Run: nohup npx tsx scripts/be-daemon.ts > /tmp/pi-a2a-be-daemon.log 2>&1 &
+ * Stop: pkill -f be-daemon.ts  (or read /tmp/pi-a2a-be-daemon.pid and kill)
  */
 import { Network } from "../extensions/net.ts";
 import { Store, type Message } from "../extensions/store.ts";
@@ -17,88 +17,88 @@ import * as path from "node:path";
 import * as os from "node:os";
 import * as fs from "node:fs";
 
-// ── BE 身份（与 FE 同 workspace/secret，才能互发现+互验）──────────────
+// ── BE identity (same workspace/secret as FE is required for discovery + mutual auth) ──
 const cfg = {
 	workspace: "test",
 	workspaceSecret: "test",
-	agentId: "be-daemon-001", // 固定 → presence 文件名稳定
+	agentId: "be-daemon-001", // fixed → stable presence filename
 	peerName: "BE",
 	role: "BE daemon (auto-echo)",
-	listenPort: 0, // OS 分配
+	listenPort: 0, // OS-assigned
 };
 
-// ── 独立 db（不污染 FE 的 db）────────────────────────────────────────
+// ── separate db (does not pollute FE's db) ──────────────────────────
 const dbPath = path.join(os.homedir(), ".pi", "agent", "pi-a2a-be.db.json");
 const store = new Store(dbPath);
 store.load();
 store.startAutoFlush();
 
-// ── Network（与 pi 扩展里 startEngine 同样的构造方式）────────────────
+// ── Network (constructed the same way as startEngine in the pi extension) ──
 const net = new Network(cfg, {
 	store,
 	onMessageReceived: (m: Message) => {
 		const tag = m.kind === "request" ? "🟡[request]" : m.kind === "result" ? "🟢[result]" : "🔵[msg]";
-		console.log(`\n[BE] ${tag} 收到 @${m.from_name} 「${m.subject || "(无主题)」"}`);
+		console.log(`\n[BE] ${tag} received from @${m.from_name} "${m.subject || "(no subject)"}"`);
 		console.log(`      ${m.body.replace(/\s+/g, " ").slice(0, 120)}`);
 
-		// kind=request → 完结入站 task 并经 push 把结果即时回给请求方（验证委派闭环）
+		// kind=request → complete the inbound task and push the result straight back to the requester (verifies the delegation loop)
 		if (m.kind === "request") {
 			const body =
-				`✅ BE 守护进程已收到你的请求并上线。\n\n` +
-				`关于「${m.subject || "(无主题)"}」: 当前为链路验证守护进程，不具备真实项目上下文，无法执行需要访问代码/文件的具体任务。\n\n` +
-				`如需真实协作，请在另一个终端运行 \`pi\` 并执行 \`/a2a-setup\` 配置为 BE(workspace=test, secret=test)，它会被注入你的消息并真正处理。\n\n` +
-				`本次仅确认: FE→BE 的 A2A SendMessage 投递成功、BE 完结 task 并经 push-notification 回结果成功。闭环 OK。`;
+				`✅ The BE daemon received your request and is online.\n\n` +
+				`Regarding "${m.subject || "(no subject)"}": this is a link-verification daemon with no real project context, so it cannot perform concrete tasks requiring access to code/files.\n\n` +
+				`For real collaboration, run \`pi\` in another terminal and use \`/a2a-setup\` to configure it as BE (workspace=test, secret=test); it will receive your injected message and actually handle it.\n\n` +
+				`This run only confirms: the FE→BE A2A SendMessage was delivered, and BE completed the task and returned the result via push-notification. Loop OK.`;
 			net
 				.completeInboundTask(m.id, body)
 				.then((ok) => {
 					console.log(
-						`[BE] 已完结 task 并回结果 @${m.from_name}: ${ok ? "✅ push 已发" : "⚠️ 无 WORKING task（可能已完结或非 request）"}`,
+						`[BE] completed task and returned result to @${m.from_name}: ${ok ? "✅ push sent" : "⚠️ no WORKING task (already complete, or not a request)"}`,
 					);
 				})
-				.catch((e) => console.log(`[BE] 回结果失败: ${e}`));
+				.catch((e) => console.log(`[BE] returning result failed: ${e}`));
 		}
 	},
 	onPeersChanged: () => {
 		const peers = net.getOnlinePeers().filter((p) => p.peerName !== cfg.peerName);
 		console.log(
-			`[BE] peers 变化: ${peers.length ? peers.map((p) => `${p.peerName}@${p.host}:${p.port}`).join(", ") : "(仅自己)"}`,
+			`[BE] peers changed: ${peers.length ? peers.map((p) => `${p.peerName}@${p.host}:${p.port}`).join(", ") : "(self only)"}`,
 		);
 	},
 	log: (msg) => console.log(`[pi-a2a] ${msg}`),
 });
 
-// ── 启动 ──────────────────────────────────────────────────────────────
+// ── start ───────────────────────────────────────────────────────────────
 await net.start();
 console.log(`\n═══════════════════════════════════════════════════════════`);
-console.log(`  BE 守护进程已启动（A2A v1.0 / JSON-RPC）`);
+console.log(`  BE daemon started (A2A v1.0 / JSON-RPC)`);
 console.log(`  agentId : ${cfg.agentId}`);
 console.log(`  peerName: ${cfg.peerName} (workspace=${cfg.workspace})`);
 console.log(`  HTTP    : 0.0.0.0:${net.getListenPort()}`);
-console.log(`  端点    : GET /.well-known/agent-card.json`);
+console.log(`  endpoints: GET /.well-known/agent-card.json`);
 console.log(`            POST /rpc  (SendMessage / GetTask)`);
-console.log(`            POST /a2a/notify (push-notification 接收)`);
+console.log(`             POST /a2a/notify (push-notification receiver)`);
 console.log(`  presence: ~/.pi/agent/pi-a2a-presence/${cfg.agentId}.json`);
 console.log(`  db      : ${dbPath}`);
-console.log(`  FE 将在 ≤10s 内发现我。`);
+console.log(`  FE will discover me within ≤10s.`);
 console.log(`═══════════════════════════════════════════════════════════\n`);
 
-// 记录 pid 便于停止
+// record the pid so it is easy to stop
 try {
 	fs.writeFileSync("/tmp/pi-a2a-be-daemon.pid", String(process.pid));
 } catch {
 	/* ignore */
 }
 
-// 心跳: 每 30s 打印一次在线 peer（确认持续可达）
+// heartbeat: print online peers every 30s (confirm continued reachability)
 setInterval(() => {
 	const peers = net.getOnlinePeers().filter((p) => p.peerName !== cfg.peerName);
 	const t = new Date().toLocaleTimeString();
-	console.log(`[BE ${t}] heartbeat | 在线 peers: ${peers.length ? peers.map((p) => p.peerName).join(",") : "无(等 FE 上线)"}`);
+	console.log(`[BE ${t}] heartbeat | online peers: ${peers.length ? peers.map((p) => p.peerName).join(",") : "none (waiting for FE)"}`);
 }, 30_000);
 
-// 优雅退出: 清 presence + 关 HTTP
+// graceful exit: clear presence + close HTTP
 async function shutdown(sig: string) {
-	console.log(`\n[BE] 收到 ${sig}，正在关闭...`);
+	console.log(`\n[BE] received ${sig}; shutting down...`);
 	await net.stop();
 	try {
 		fs.unlinkSync("/tmp/pi-a2a-be-daemon.pid");

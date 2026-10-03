@@ -20,15 +20,15 @@ This is **not** human chat or a shared-blackboard (that's pi-sync). It's a direc
 pi-a2a speaks the open **[Google A2A (Agent2Agent) Protocol v1.0](https://a2aproject.github.io/A2A/v1.0.0/specification/)** — JSON-RPC 2.0 over HTTP. Each agent is simultaneously an A2A **server** (exposes an Agent Card + JSON-RPC endpoint) and an A2A **client** (calls other agents' endpoints). Symmetry comes for free.
 
 ```
-局域网 LAN（无中心服务器）
-┌──────────────┐  mDNS(发现)  ┌──────────────┐
+LAN (no central server)
+┌──────────────┐  mDNS(discover) ┌──────────────┐
 │   Agent A     │◄───────────►│   Agent B     │
 │ A2A server:   │  JSON-RPC   │ A2A server:   │
 │  Agent Card   │ ◄─────────► │  Agent Card   │
 │  POST /rpc    │ (SendMessage│  POST /rpc    │
 │  POST /notify │  + push)    │  POST /notify │
-│ 内嵌 mDNS广告  │             │ 内嵌 mDNS广告  │
-│ 本地 DB       │             │ 本地 DB       │
+│ embedded mDNS │             │ embedded mDNS │
+│ local DB      │             │ local DB      │
 └──────────────┘             └──────────────┘
 ```
 
@@ -231,7 +231,7 @@ Slash commands let you use pi-a2a **without involving the AI** — they run dire
 /a2a-inbox                    # recent 20 messages (● unread, ○ read)
 /a2a-inbox unread             # only unread
 /a2a-inbox msg_xxxxx          # read full message + mark as read
-/a2a-send frontend 你好       # quick message to @frontend
+/a2a-send frontend hello      # quick message to @frontend
 /a2a-send                     # interactive: pick peer → subject → body
 /a2a-clear                    # clear inbox (archives & sent history kept)
 ```
@@ -243,9 +243,9 @@ Slash commands let you use pi-a2a **without involving the AI** — they run dire
 A small status panel renders below the editor. It refreshes on events (new message, peer up/down) plus a low-frequency backstop:
 
 ```
-🟢 a2a·backend·写API
-  📨 2 未读
-  在线: frontend·写UI reviewer·审查
+🟢 a2a·backend·api
+  📨 2 unread
+  online: frontend·ui reviewer·review
 ```
 
 New messages trigger a toast notification.
@@ -305,18 +305,18 @@ Every `SendMessage` produces an A2A `Task` (uniform wire format); behavior is ke
 | `request` | `WORKING` → recipient processes → `COMPLETED`+Artifact | ✅ delegated | ✅ via push-notification |
 | `result` | immediately `COMPLETED` (stored + **auto-received**) | ✅ injected | ❌ synchronous ack |
 
-> `request` 与 `result` 都会被**自动注入收件人当前会话**（见下节）。普通 `message` 只 toast 通知，不打扰，需手动 `a2a_read` 查看。
+> Both `request` and `result` are **auto-injected into the recipient's current session** (see below). A plain `message` only shows a toast — it does not interrupt and must be read with `a2a_read`.
 
-### Delegation（主动调动对方 agent）
+### Delegation (actively activating the other agent)
 
-`kind=request` 不只是个标签——它是真正的任务委派：
+`kind=request` is not just a label — it is genuine task delegation:
 
-1. **A 发请求** — `a2a_send(to="backend", kind="request", subject="...", body="...")`，异步发出（fire-and-forget）。
-2. **B 被调动** — B 收到后，pi-a2a 自动调 `pi.sendUserMessage(...)` 把任务**注入 B 的当前会话**，B 的 LLM 立刻着手处理（B 正忙则排队到当前 turn 之后，不中断）。普通 `message` 不会注入，只 toast。
-3. **B 回结果** — 注入的提示已指引 B 处理完调 `a2a_reply(message_id, body)` 回复；若原消息是 request，回复自动标为 `result`。
-4. **A 自动收结果** — 该 `result` 回执**经 A2A push-notification 即时送达 A**（A 发 request 时已注册 webhook）：B 完结 task 后 POST `{task:{status:COMPLETED, artifacts:[...]}}` 到 A 的 `/a2a/notify`，A 校验 token、取出 Artifact、同样**自动注入 A 的当前会话**，A 无需手动 `a2a_inbox` / `a2a_read`。委派全流程因此形成无人值守闭环。（push 万一丢失，A 的兑底扫描器会在超时后主动 `GetTask` 补取结果，不会永久丢失。）
+1. **A sends a request** — `a2a_send(to="backend", kind="request", subject="...", body="...")`, sent asynchronously (fire-and-forget).
+2. **B is activated** — on receipt, pi-a2a automatically calls `pi.sendUserMessage(...)` to **inject the task into B's current session**, and B's LLM starts working on it immediately (if B is busy it queues after the current turn without interrupting). A plain `message` is not injected; it only shows a toast.
+3. **B returns the result** — the injected prompt instructs B to reply with `a2a_reply(message_id, body)` when done; if the original message was a request, the reply is automatically marked `result`.
+4. **A receives the result automatically** — the `result` receipt is **delivered to A immediately via A2A push-notification** (A registered a webhook when sending the request): after completing the task, B POSTs `{task:{status:COMPLETED, artifacts:[...]}}` to A's `/a2a/notify`; A validates the token, extracts the Artifact and likewise **auto-injects it into A's current session**, so A needs no manual `a2a_inbox` / `a2a_read`. The whole delegation flow is therefore an unattended loop. (If a push is ever lost, A's fallback scanner actively calls `GetTask` after the timeout to recover the result, so it is never lost permanently.)
 
-> 注入到 B 的当前会话会写入 B 的对话历史（适合同机协作）。想要完全隔离的任务处理，可在 B 端用 `newSession` fork——本实现默认注入当前会话。
+> Injection into B's current session is written to B's conversation history (suitable for same-machine collaboration). For fully isolated task handling, fork with `newSession` on B — this implementation injects into the current session by default.
 
 ## A2A endpoints
 

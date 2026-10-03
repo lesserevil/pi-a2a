@@ -1,14 +1,14 @@
 /**
- * pi-a2a — 文件传输（peer-to-peer blob transfer，绕过 LLM 上下文）
+ * pi-a2a — file transfer (peer-to-peer blob transfer, bypassing LLM context)
  *
- * 设计：
- *   - 所有文件读写都限制在一个沙箱根目录（默认 ~/.pi/a2a-files）下，
- *     路径先 resolve 再校验仍在根目录内，杜绝 ../ 逃逸。
- *   - 传输走现有 A2A HTTP server 的两个新端点：
- *       POST /file   收文件（body = 原始字节，元数据在 query）
- *       GET  /file   发文件（?path=<沙箱相对路径>，响应体 = 原始字节）
- *   - 完整性：随文件带 sha256，接收端落盘后重新计算并比对。
- *   - 计数：单次传输上限可配（默认 64 MiB），避免打爆内存/磁盘。
+ * Design:
+ *   - all file reads/writes are confined to a sandbox root (default ~/.pi/a2a-files);
+ *     paths are resolved then verified to still be inside the root, preventing ../ escapes.
+ *   - transfer uses two new endpoints on the existing A2A HTTP server:
+ *       POST /file   receive a file (body = raw bytes, metadata in the query)
+ *       GET  /file   send a file (?path=<sandbox-relative path>, response body = raw bytes)
+ *   - integrity: sha256 travels with the file; the receiver recomputes and compares after writing.
+ *   - limits: per-transfer cap is configurable (default 64 MiB) to avoid exhausting memory/disk.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -18,7 +18,7 @@ import * as crypto from "node:crypto";
 export const DEFAULT_FILE_ROOT = path.join(os.homedir(), ".pi", "a2a-files");
 export const DEFAULT_FILE_MAX_BYTES = 64 * 1024 * 1024; // 64 MiB
 
-/** 展开 ~ 并取绝对路径。 */
+/** Expand ~ and return an absolute path. */
 export function resolveFileRoot(configured?: string): string {
   const raw = (configured ?? "").trim() || DEFAULT_FILE_ROOT;
   const expanded = raw.startsWith("~") ? path.join(os.homedir(), raw.slice(1)) : raw;
@@ -26,12 +26,12 @@ export function resolveFileRoot(configured?: string): string {
 }
 
 /**
- * 把一个「沙箱相对路径」解析为根目录内的绝对路径。
- * 拒绝绝对路径与任何逃逸出根的相对路径。
+ * Resolve a sandbox-relative path to an absolute path inside the root.
+ * Rejects absolute paths and any relative path escaping the root.
  */
 export function sandboxPath(root: string, rel: string): string {
   if (!rel || typeof rel !== "string") throw new Error("path required");
-  // 归一化：去掉前导斜杠，统一分隔符
+  // normalise: strip the leading slash, unify separators
   const cleaned = rel.replace(/\\/g, "/").replace(/^\/+/, "");
   if (cleaned.split("/").includes("..")) throw new Error("path escapes file root");
   const abs = path.resolve(root, cleaned);
@@ -42,7 +42,7 @@ export function sandboxPath(root: string, rel: string): string {
   return abs;
 }
 
-/** 绝对路径 → 相对沙箱根的路径（用于回执中展示）。 */
+/** Absolute path -> path relative to the sandbox root (for display in receipts). */
 export function relativeToRoot(root: string, abs: string): string {
   const rel = path.relative(root, abs);
   return rel.split(path.sep).join("/");
@@ -58,7 +58,7 @@ export function sha256Buffer(buf: Buffer): string {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
-/** 接收文件：写盘并校验 sha256；返回落盘信息。 */
+/** Receive a file: write to disk and verify sha256; returns write info. */
 export interface ReceivedFile {
   abs: string;
   rel: string;
@@ -86,7 +86,7 @@ export function writeReceivedFile(
   return { abs, rel: relativeToRoot(root, abs), bytes: data.length, sha256: actual };
 }
 
-/** 读取待发送文件：校验存在于沙箱内，返回字节 + 元数据。 */
+/** Read a file to send: verify it exists in the sandbox, return bytes + metadata. */
 export interface OutgoingFile {
   data: Buffer;
   rel: string;

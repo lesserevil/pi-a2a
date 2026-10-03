@@ -5,11 +5,11 @@
   "peerName": "my-agent-name",
   "role": "what this agent does (optional)",
   "listenPort": 0,
-  "_net_comment": "advertiseHost 覆盖对外广告/回推 URL 的 host；mdnsInterface 仅在本机默认组播出口走错网卡时设置（如 Windows+Tailscale）；同网段多地址主机不要设置 mdnsInterface。",
+  "_net_comment": "advertiseHost overrides the host used in advertising/callback URLs; set mdnsInterface only when the host's default multicast egress uses the wrong NIC (e.g. Windows+Tailscale); do not set mdnsInterface on hosts with multiple addresses on the same subnet.",
   "advertiseHost": "",
   "mdnsInterface": "",
 
-  "_a2a_comment": "以下均为可选字段，省略即用默认值。A2A JSON-RPC over HTTP；共享密钥作 Bearer。",
+  "_a2a_comment": "All fields below are optional; omit them to use defaults. A2A JSON-RPC over HTTP; the shared secret is used as the Bearer token.",
   "agentCardPath": "/.well-known/agent-card.json",
   "rpcPath": "/rpc",
   "notifyPath": "/a2a/notify",

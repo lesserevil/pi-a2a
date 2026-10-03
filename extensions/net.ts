@@ -1,26 +1,26 @@
 /**
- * pi-a2a — 网络层（A2A / 局域网 P2P）
+ * pi-a2a — network layer (A2A / LAN P2P)
  *
- * 实现 Google A2A Protocol v1.0 的 JSON-RPC binding（spec §9）。
+ * Implements the JSON-RPC binding of Google's A2A Protocol v1.0 (spec §9).
  *
- * 每个 agent 同时是 A2A Server + Client：
+ * Every agent is both an A2A server and client:
  *   Server (node:http):
  *     GET  /.well-known/agent-card.json  — Agent Card
- *     GET  /health                        — mDNS 续命探测（非 spec，无害）
+ *     GET  /health                        — mDNS keep-alive probe (not in spec, harmless)
  *     POST /rpc                           — JSON-RPC: SendMessage / GetTask
- *     POST /a2a/notify                    — push-notification webhook 接收
- *     POST /file                          — 收文件（body=原始字节，元数据在 query）
- *     GET  /file?path=<rel>               — 发文件（响应体=原始字节）
+ *     POST /a2a/notify                    — push-notification webhook receiver
+ *     POST /file                          — receive a file (body=raw bytes, metadata in query)
+ *     GET  /file?path=<rel>               — send a file (response body=raw bytes)
  *   Client (fetch):
- *     send(peer, msg)     — SendMessage（request 时附 pushNotificationConfig）
- *     getTask(peer, id)   — GetTask（push 兜底）
- *     notifyPeer(url, t)  — 完成入站 task 时把结果 push 给请求方
- *     putFile(peer, ...)  — 推送本地沙箱文件到 peer
- *     getFile(peer, ...)  — 从 peer 拉取文件到本地沙箱
+ *     send(peer, msg)     — SendMessage (attaches pushNotificationConfig for requests)
+ *     getTask(peer, id)   — GetTask (push fallback)
+ *     notifyPeer(url, t)  — push the result to the requester when an inbound task completes
+ *     putFile(peer, ...)  — push a local sandbox file to a peer
+ *     getFile(peer, ...)  — pull a file from a peer into the local sandbox
  *
- * 发现: mDNS/Bonjour 广告 + 浏览 _pi-a2a._tcp（TXT proto=a2a）+ 同机 presence 兜底。
- * 鉴权: 共享 workspaceSecret 作 Bearer token（每个 JSON-RPC 请求校验）。
- * 异步: 对方离线 → 本地 outbox 暂存，上线重投；出站 request 等 push 回结果，超时兜底 GetTask。
+ * Discovery: mDNS/Bonjour advertise + browse _pi-a2a._tcp (TXT proto=a2a) + same-host presence fallback.
+ * Auth: the shared workspaceSecret as a Bearer token (validated on every JSON-RPC request).
+ * Async: peer offline → queued in the local outbox, redelivered on reconnect; outbound requests wait for a push result with a GetTask fallback on timeout.
  */
 import * as http from "node:http";
 import * as fs from "node:fs";
@@ -49,21 +49,21 @@ export interface Peer {
 }
 
 export interface DeliverResult {
-  delivered: string[]; // 成功送达的 peerName
-  queued: string[]; // 进 outbox 的 peerName（定向、离线）
-  failed: string[]; // 广播时未能送达的在线 peer
+  delivered: string[]; // peerNames delivered successfully
+  queued: string[]; // peerNames queued in the outbox (targeted, offline)
+  failed: string[]; // online peers not reached during a broadcast
 }
 
 export interface NetHooks {
   store: Store;
-  onMessageReceived: (m: Message) => void; // 收到新消息 → toast + (request/result)注入
-  onPeersChanged: () => void; // peer 上下线 → 刷 widget
+  onMessageReceived: (m: Message) => void; // new message → toast + (request/result) injection
+  onPeersChanged: () => void; // peer online/offline → refresh widget
   log?: (msg: string) => void;
 }
 
-// ── 常量 ───────────────────────────────────────────────
+// ── constants ───────────────────────────────────────────
 const SERVICE_TYPE = "pi-a2a";
-const PROTO = "a2a"; // A2A 协议标记（硬切：旧 proto=1 不再识别）
+const PROTO = "a2a"; // A2A protocol marker (hard cut: legacy proto=1 is no longer recognised)
 const A2AVER = "1.0";
 const PEER_TTL_MS = 60_000;
 const REFRESH_INTERVAL_MS = 10_000;
@@ -73,13 +73,13 @@ const PRESENCE_TTL_MS = 35_000;
 const DEFAULT_PUSH_SWEEP_MS = 15_000;
 const DEFAULT_PUSH_BACKSTOP_MS = 30_000;
 
-/** presence 文件记录（本机 `~/.pi/agent/pi-a2a-presence/<agentId>-<pid>.json`）。 */
+/** presence file record (this host: `~/.pi/agent/pi-a2a-presence/<agentId>-<pid>.json`). */
 export interface PresenceRec {
   peerName: string;
   agentId: string;
   role?: string;
-  workspace: string; // 明文，向后兼容旧版本（过渡期双发；后续废弃）
-  wsh?: string; // workspace hash，隔离靠它（明文 ws 存在泄漏，已迁移到此）
+  workspace: string; // plaintext, back-compat with older versions (dual-sent during transition; to be removed)
+  wsh?: string; // workspace hash; isolation relies on it (plaintext ws leaks, so it has been migrated here)
   host: string;
   port: number;
   proto: string;
@@ -89,8 +89,8 @@ export interface PresenceRec {
 
 /**
  * workspace hash：sha256(len(ws):ws:len(secret):secret)[:16]（64bit）。
- * 用长度前缀而非纯分隔符——纯 `:` 分隔会被 `ws=a:b,secret=c` 与 `ws=a,secret=b:c` 撞出相同输入串（两者都拼成 "a:b:c"）。
- * 长度前缀是密码学拼接防撞的标准做法：`3:a:b:1:c` ≠ `1:a:3:b:c`。
+ * Use length prefixes rather than plain delimiters — plain `:` separators collide: `ws=a:b,secret=c` and `ws=a,secret=b:c` produce the same input string (both concatenate to "a:b:c").
+ * Length prefixes are the standard way to make concatenation collision-resistant: `3:a:b:1:c` ≠ `1:a:3:b:c`.
  */
 export function wsHash(workspace: string, secret: string): string {
   const payload = `${workspace.length}:${workspace}:${secret.length}:${secret}`;
@@ -98,21 +98,21 @@ export function wsHash(workspace: string, secret: string): string {
 }
 
 /**
- * workspace 匹配：优先 wsh（hash），缺失才回退 ws 明文。
- * 兼容窗口：新版本双发 ws+wsh，旧版本只发 ws。新版本发现旧版本走 ws 回退，旧版本发现新版本靠双发的 ws 命中。
+ * workspace matching: prefer wsh (hash), fall back to plaintext ws only when absent.
+ * Compatibility window: new versions send both ws+wsh, old versions only ws. New→old uses the ws fallback; old→new matches on the dual-sent ws.
  */
 export function wsMatch(
   their: { ws?: string; wsh?: string },
   mine: { workspace: string; workspaceSecret: string },
 ): boolean {
   if (their.wsh) return their.wsh === wsHash(mine.workspace, mine.workspaceSecret);
-  // 对端是旧版本（无 wsh），回退明文 ws 匹配
+  // peer is an older version (no wsh); fall back to plaintext ws matching
   return !!their.ws && their.ws === mine.workspace;
 }
 
 /**
- * presence 去重：同 agentId 可能多个 pid 文件（同目录双进程），按 ts 最新保留。
- * Production 与 test 共用此函数，从根源消除「抽离 helper」漂移问题。
+ * presence dedup: the same agentId may have several pid files (two processes in one directory); keep the newest by ts.
+ * Production and tests share this function, eliminating helper-drift at the root.
  */
 export function dedupePresence<T extends { agentId?: string; ts?: number }>(records: T[]): T[] {
   const byAgent = new Map<string, { rec: T; ts: number }>();
@@ -125,7 +125,7 @@ export function dedupePresence<T extends { agentId?: string; ts?: number }>(reco
   return [...byAgent.values()].map((v) => v.rec);
 }
 
-// JSON-RPC 错误码（spec §5.4 / §9.5）
+// JSON-RPC error codes (spec §5.4 / §9.5)
 const ERR_PARSE = -32700;
 const ERR_INVALID_REQ = -32600;
 const ERR_METHOD_NOT_FOUND = -32601;
@@ -133,7 +133,7 @@ const ERR_INVALID_PARAMS = -32602;
 const ERR_INTERNAL = -32603;
 const ERR_TASK_NOT_FOUND = -32001;
 
-// ── JSON-RPC / A2A 小工具 ──────────────────────────────
+// ── JSON-RPC / A2A helpers ──────────────────────────────
 
 function isoNow(): string {
   return new Date().toISOString();
@@ -153,8 +153,8 @@ function rpcError(id: any, code: number, message: string, data?: unknown) {
   return { jsonrpc: "2.0", id, error: err };
 }
 
-/** 虚拟网卡名特征（Docker / WSL / Hyper-V / VMware / VirtualBox / VPN / tunnel 等）。
- *  这些网卡的地址只在宿主机内部可达，跨机不可达；若广告出去会导致 peer 连不上。 */
+/** Virtual NIC name markers (Docker / WSL / Hyper-V / VMware / VirtualBox / VPN / tunnel, etc.).
+ *  Addresses on these NICs are only reachable inside the host, not across machines; advertising them makes peers unable to connect. */
 const VIRTUAL_IFACE_RE =
   /^(docker|br-|veth|vEthernet|WSL|Hyper-V|VMware|VMnet|VirtualBox|TAP|tun|utun|llw|awdl|bridge|tap|p2p|anpi)/i;
 
@@ -162,9 +162,9 @@ function isLikelyVirtualIface(name: string): boolean {
   return VIRTUAL_IFACE_RE.test(name);
 }
 
-/** 取本机 LAN IPv4（push webhook URL 用；跨机可达，同机也能自达）。
- *  优先返回真实物理/无线网卡；跳过虚拟网卡（Docker/WSL/Hyper-V 等），
- *  仅当没有任何真实网卡时才回退到虚拟网卡地址。 */
+/** Get this host's LAN IPv4 (used in the push webhook URL; reachable across machines and from itself).
+ *  Prefer a real physical/wireless NIC; skip virtual NICs (Docker/WSL/Hyper-V, etc.),
+ *  falling back to a virtual NIC address only when there is no real NIC at all. */
 function getLocalLanIp(): string {
   try {
     const ifaces = os.networkInterfaces();
@@ -186,7 +186,7 @@ function getLocalLanIp(): string {
   return "127.0.0.1";
 }
 
-/** 从 A2A Message.parts 里抽出文本（拼所有 TextPart）。 */
+/** Extract text from A2A Message.parts (concatenating all TextParts). */
 function extractText(parts: any[]): string {
   if (!Array.isArray(parts)) return "";
   return parts
@@ -203,7 +203,7 @@ export class Network {
   private listenPort = 0;
   private lanIp = "127.0.0.1";
   private peers = new Map<string, Peer>();
-  private snapshottedPeers = new Set<string>(); // 已拉过 mem snapshot 的 peer（防同进程重复；重启重拉，幂等）
+  private snapshottedPeers = new Set<string>(); // peers whose mem snapshot has already been pulled (prevents repeats within a process; re-pulled on restart, idempotent)
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private pushSweepTimer: ReturnType<typeof setInterval> | null = null;
   private refreshing = false;
@@ -238,7 +238,7 @@ export class Network {
     return ++this.reqIdCounter;
   }
 
-  // ── 生命周期 ───────────────────────────────────────────
+  // ── lifecycle ───────────────────────────────────────────
 
   async start(): Promise<void> {
     this.lanIp = this.config.advertiseHost?.trim() || getLocalLanIp();
@@ -287,7 +287,7 @@ export class Network {
     }
   }
 
-  // ── peer 表查询 ────────────────────────────────────────
+  // ── peer table queries ──────────────────────────────────
 
   getPeers(): Peer[] {
     return [...this.peers.values()];
@@ -304,18 +304,18 @@ export class Network {
     return !!p && p.lastSeen >= Date.now() - PEER_TTL_MS;
   }
 
-  // ── HTTP server（A2A Server 侧）──────────────────────
+  // ── HTTP server (A2A server side) ───────────────────────
 
   private startHttp(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.server = http.createServer((req, res) => this.handle(req, res));
-      this.server.on("error", (e) => this.hooks.log?.(`HTTP server 错误: ${e?.message ?? e}`));
+      this.server.on("error", (e) => this.hooks.log?.(`HTTP server error: ${e?.message ?? e}`));
       const port = this.config.listenPort ?? 0;
       this.server.listen(port, "0.0.0.0", () => {
         const addr = this.server!.address();
         this.listenPort = typeof addr === "object" && addr ? addr.port : port;
         this.hooks.log?.(
-          `A2A HTTP 监听 0.0.0.0:${this.listenPort} (lanIp=${this.lanIp}${this.config.advertiseHost ? " [手动指定]" : ""})`,
+          `A2A HTTP listening on 0.0.0.0:${this.listenPort} (lanIp=${this.lanIp}${this.config.advertiseHost ? " [manual]" : ""})`,
         );
         resolve();
       });
@@ -326,41 +326,41 @@ export class Network {
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = req.url ?? "";
     try {
-      // Agent Card（无需鉴权，spec 要求可公开发现）
+      // Agent Card (no auth; the spec requires public discoverability)
       if (req.method === "GET" && url === this.agentCardPath) {
         return this.json(res, 200, this.agentCard(), { "Cache-Control": "max-age=60" });
       }
-      // 健康探测（mDNS 续命用，非 spec）
+      // health probe (used for mDNS keep-alive; not in spec)
       if (req.method === "GET" && url === "/health") {
         return this.json(res, 200, {
           status: "ok",
           peer: this.config.peerName,
-          workspace: this.config.workspace, // 明文，向后兼容（过渡期双发）
+          workspace: this.config.workspace, // plaintext, back-compat (dual-sent during transition)
           wsh: wsHash(this.config.workspace, this.config.workspaceSecret), // workspace hash
           proto: PROTO,
         });
       }
-      // 运维统计（per-peer outbox 积压 + 累计丢弃数；需鉴权，防静默丢消息可查）
+      // operational stats (per-peer outbox backlog + cumulative drops; auth required so silent message loss is observable)
       if (req.method === "GET" && url === "/stats") {
         if (!this.checkAuth(req)) return this.json(res, 401, { error: "unauthorized" });
         return this.json(res, 200, this.hooks.store.getStats());
       }
-      // JSON-RPC 端点
+      // JSON-RPC endpoint
       if (req.method === "POST" && url === this.rpcPath) {
         return this.handleRpc(req, res);
       }
-      // push-notification webhook 接收
+      // push-notification webhook receiver
       if (req.method === "POST" && url === this.notifyPath) {
         return this.handleNotify(req, res);
       }
-      // 文件传输：按路径分发（带 query）
+      // file transfer: dispatch by path (with query)
       if (url === this.filePath || url.startsWith(this.filePath + "?")) {
         if (req.method === "POST") return this.handleFileReceive(req, res);
         if (req.method === "GET") return this.handleFileSend(req, res);
       }
       this.json(res, 404, { error: "Not found" });
     } catch (e) {
-      this.hooks.log?.(`handle 异常: ${e instanceof Error ? e.message : String(e)}`);
+      this.hooks.log?.(`handle exception: ${e instanceof Error ? e.message : String(e)}`);
       try {
         this.json(res, 500, { error: "internal" });
       } catch {
@@ -369,7 +369,7 @@ export class Network {
     }
   }
 
-  /** 校验 Bearer 共享密钥。 */
+  /** Validate the Bearer shared secret. */
   private checkAuth(req: http.IncomingMessage): boolean {
     const auth = req.headers["authorization"];
     const secret = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
@@ -403,7 +403,7 @@ export class Network {
     }
   }
 
-  /** SendMessage：收到一条消息 → 建 task → 按 kind 决定注入/通知。 */
+  /** SendMessage: a message arrives → create a task → decide inject vs notify by kind. */
   private handleSendMessage(params: any, res: http.ServerResponse, id: any): void {
     const msg = params?.message;
     if (!msg || !Array.isArray(msg.parts) || msg.parts.length === 0) {
@@ -427,7 +427,7 @@ export class Network {
 
     const inboxMsg: Message = {
       id: incomingMsgId,
-      thread_id: contextId, // A2A contextId = 本地线程
+      thread_id: contextId, // A2A contextId = local thread
       reply_to: null,
       from_id: "",
       from_name: fromName,
@@ -458,7 +458,7 @@ export class Network {
     this.rpcJson(res, id, rpcResult(id, { task }));
   }
 
-  /** GetTask：返回本地 task 状态（push 兜底用）。 */
+  /** GetTask: return local task state (used as the push fallback). */
   private handleGetTask(params: any, res: http.ServerResponse, id: any): void {
     const taskId = String(params?.id ?? "");
     const t = this.hooks.store.getInboundTaskByTaskId(taskId);
@@ -479,7 +479,7 @@ export class Network {
     this.rpcJson(res, id, rpcResult(id, this.buildTask(t.taskId, t.contextId, t.state, t.artifactText)));
   }
 
-  /** MemUpdate：收到远端单个 entry 增量 → LWW 合并。不 re-broadcast（发送方已广播）。 */
+  /** MemUpdate: receive a single remote entry delta → LWW merge. Not re-broadcast (the sender already broadcast). */
   private handleMemUpdate(params: any, res: http.ServerResponse, id: any): void {
     const key = String(params?.key ?? "");
     const entry = params?.entry;
@@ -491,14 +491,14 @@ export class Network {
     this.rpcJson(res, id, rpcResult(id, { applied: changed }));
   }
 
-  /** MemSnapshot：返回本地全量 mem（含 tombstone），供新 peer bootstrap 对齐。 */
+  /** MemSnapshot: return the full local mem (including tombstones) so new peers can bootstrap. */
   private handleMemSnapshot(res: http.ServerResponse, id: any): void {
     this.rpcJson(res, id, rpcResult(id, { entries: this.hooks.store.memGetAll() }));
   }
 
-  /** push-notification 接收：对方完成我委派的 task → 解析 → 注入。 */
+  /** push-notification receiver: the peer completed a task I delegated → parse → inject. */
   private async handleNotify(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    // 鉴权：Bearer 或 X-A2A-Notification-Token 任一 == 共享密钥
+    // auth: either Bearer or X-A2A-Notification-Token must equal the shared secret
     const auth = req.headers["authorization"];
     const bearer = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
     const xToken = req.headers["x-a2a-notification-token"];
@@ -512,19 +512,19 @@ export class Network {
     } catch {
       return this.json(res, 400, { error: "bad payload" });
     }
-    // StreamResponse: {task} 或 {statusUpdate}（取其 task）
+    // StreamResponse: {task} or {statusUpdate} (take its task)
     const task = body?.task ?? body?.statusUpdate;
     if (task) this.handleIncomingTaskUpdate(task);
-    this.json(res, 200, {}); // 幂等 ack
+    this.json(res, 200, {}); // idempotent ack
   }
 
-  /** 处理一条出站 task 的状态更新（push 或 GetTask 兜底共用）。 */
+  /** Handle a state update for an outbound task (shared by push and the GetTask fallback). */
   private handleIncomingTaskUpdate(task: any): void {
     const taskId = String(task?.id ?? "");
     const state = String(task?.status?.state ?? "");
     const ob = this.hooks.store.getOutboundTaskByTaskId(taskId);
-    if (!ob) return; // 未知/重复 → 忽略（幂等）
-    if (!Store.isTerminalState(state)) return; // 还没完成，继续等
+    if (!ob) return; // unknown/duplicate → ignore (idempotent)
+    if (!Store.isTerminalState(state)) return; // not finished yet; keep waiting
 
     const arts = Array.isArray(task?.artifacts) ? task.artifacts : [];
     const text =
@@ -535,12 +535,12 @@ export class Network {
 
     const success = state === "TASK_STATE_COMPLETED";
     const body = success
-      ? text || "(空结果)"
-      : `[委派未完成: ${state.replace("TASK_STATE_", "")}]${text ? "\n" + text : ""}`;
+      ? text || "(empty result)"
+      : `[delegation incomplete: ${state.replace("TASK_STATE_", "")}]${text ? "\n" + text : ""}`;
 
     const resultMsg: Message = {
       id: genId("msg"),
-      thread_id: ob.contextId, // 回填到原始 request 的线程
+      thread_id: ob.contextId, // backfill into the original request's thread
       reply_to: ob.msgId,
       from_id: "",
       from_name: ob.peerName,
@@ -556,10 +556,10 @@ export class Network {
     };
     this.hooks.store.addMessage(resultMsg);
     this.hooks.store.persist();
-    this.hooks.onMessageReceived(resultMsg); // kind=result → 自动注入
+    this.hooks.onMessageReceived(resultMsg); // kind=result → auto-inject
   }
 
-  // ── A2A 构造 ───────────────────────────────────────────
+  // ── A2A construction ────────────────────────────────────
 
   private agentCard(): any {
     return {
@@ -618,9 +618,9 @@ export class Network {
     return task;
   }
 
-  // ── A2A Client 侧 ──────────────────────────────────────
+  // ── A2A client side ─────────────────────────────────────
 
-  /** 发起 JSON-RPC 调用。返回 {result} 或 {error}（网络失败抛异常）。 */
+  /** Make a JSON-RPC call. Returns {result} or {error} (throws on network failure). */
   private async rpcCall(peer: Peer, method: string, params: any, timeoutMs = POST_TIMEOUT_MS): Promise<any> {
     const url = `http://${peer.host}:${peer.port}${this.rpcPath}`;
     const ctrl = new AbortController();
@@ -641,9 +641,9 @@ export class Network {
     }
   }
 
-  /** 投递一条「我发出的」消息（已写本地 store direction=sent）。 */
+  /** Deliver an outgoing message (already written to the local store with direction=sent). */
   async deliver(msg: Message): Promise<DeliverResult> {
-    // 广播：推给当前所有在线 peer
+    // broadcast: push to all currently online peers
     if (msg.to_name === "*") {
       const online = this.getOnlinePeers().filter((p) => p.peerName !== this.config.peerName);
       const delivered: string[] = [];
@@ -654,7 +654,7 @@ export class Network {
       }
       return { delivered, queued: [], failed };
     }
-    // 定向：在线直推，离线/失败进 outbox
+    // targeted: push directly when online; queue in the outbox when offline/failed
     if (this.isOnline(msg.to_name)) {
       const peer = this.getPeer(msg.to_name)!;
       if (await this.sendToOne(peer, msg)) return { delivered: [peer.peerName], queued: [], failed: [] };
@@ -664,13 +664,13 @@ export class Network {
     return { delivered: [], queued: [msg.to_name], failed: [] };
   }
 
-  /** 向某 peer 发 A2A SendMessage。成功后若是 request 则登记待 push 的出站 task。 */
+  /** Send an A2A SendMessage to a peer. On success, register an outbound task awaiting push if it was a request. */
   private async sendToOne(peer: Peer, msg: Message): Promise<boolean> {
     const params: any = {
       message: {
         messageId: msg.id,
         role: "ROLE_USER",
-        contextId: msg.thread_id, // 本地线程 = A2A contextId
+        contextId: msg.thread_id, // local thread = A2A contextId
         parts: [{ text: msg.body }],
         metadata: {
           kind: msg.kind,
@@ -679,7 +679,7 @@ export class Network {
         },
       },
     };
-    // request → 注册 push，结果即时回推
+    // request → register push so the result comes back immediately
     if (msg.kind === "request") {
       params.configuration = {
         pushNotificationConfig: {
@@ -692,7 +692,7 @@ export class Network {
     try {
       const j = await this.rpcCall(peer, "SendMessage", params);
       if (j.error) {
-        this.hooks.log?.(`SendMessage 错误 ← ${peer.peerName}: ${j.error.message}`);
+        this.hooks.log?.(`SendMessage error ← ${peer.peerName}: ${j.error.message}`);
         return false;
       }
       const task = j.result?.task;
@@ -709,12 +709,12 @@ export class Network {
       }
       return true;
     } catch (e) {
-      this.hooks.log?.(`sendToOne 失败 → ${peer.peerName}: ${e instanceof Error ? e.message : String(e)}`);
+      this.hooks.log?.(`sendToOne failed → ${peer.peerName}: ${e instanceof Error ? e.message : String(e)}`);
       return false;
     }
   }
 
-  /** 把完成的入站 task 结果 push 给请求方（a2a_reply 回 request 时调用）。 */
+  /** Push a completed inbound task's result to the requester (called when a2a_reply answers a request). */
   async completeInboundTask(msgId: string, body: string, state = "TASK_STATE_COMPLETED"): Promise<boolean> {
     const t = this.hooks.store.getWorkingInboundTaskByMsgId(msgId);
     if (!t) return false;
@@ -723,12 +723,12 @@ export class Network {
     if (t.pushConfig) {
       const task = this.buildTask(t.taskId, t.contextId, state, body);
       const ok = await this.notifyPeer(t.pushConfig.url, t.pushConfig.token, task);
-      if (!ok) this.hooks.log?.(`push 结果失败 → ${t.pushConfig.url}（task=${t.taskId}）`);
+      if (!ok) this.hooks.log?.(`push result failed → ${t.pushConfig.url} (task=${t.taskId})`);
     }
     return true;
   }
 
-  /** POST push-notification（StreamResponse {task}）到对方 webhook。 */
+  /** POST a push-notification (StreamResponse {task}) to the peer's webhook. */
   private async notifyPeer(url: string, token: string, task: any): Promise<boolean> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), POST_TIMEOUT_MS);
@@ -751,30 +751,30 @@ export class Network {
     }
   }
 
-  /** push 兜底：超时未收到 push 的出站 task 主动 GetTask 补救。 */
+  /** push fallback: actively GetTask for outbound tasks whose push never arrived. */
   private async pushSweep(): Promise<void> {
     const backstop = this.config.pushBackstopMs ?? DEFAULT_PUSH_BACKSTOP_MS;
     const now = Date.now();
     const pending = this.hooks.store.getPendingOutbound();
     for (const ob of pending) {
-      if (now - ob.createdAt * 1000 < backstop) continue; // 还新鲜，继续等 push
-      if (!this.isOnline(ob.peerName)) continue; // 对方离线，无法轮询
+      if (now - ob.createdAt * 1000 < backstop) continue; // still fresh; keep waiting for the push
+      if (!this.isOnline(ob.peerName)) continue; // peer offline; cannot poll
       const peer = this.getPeer(ob.peerName);
       if (!peer) continue;
       try {
         const j = await this.rpcCall(peer, "GetTask", { id: ob.taskId });
-        const task = j?.result; // GetTask result = Task 对象
+        const task = j?.result; // GetTask result = Task object
         if (task && Store.isTerminalState(String(task.status?.state ?? ""))) {
           this.handleIncomingTaskUpdate(task);
         }
       } catch {
-        /* 忽略，下次再试 */
+        /* ignore; retry next time */
       }
     }
   }
 
-  // ── mDNS 广告 + 浏览 ───────────────────────────────────
-  // （与旧版基本一致；TXT proto 改 "a2a"，硬切忽略非 a2a peer）
+  // ── mDNS advertise + browse ─────────────────────────────
+  // (largely unchanged from older versions; TXT proto is now "a2a" and non-a2a peers are ignored by hard cut)
 
   private startMdns(): void {
     let BonjourCtor: any = null;
@@ -783,7 +783,7 @@ export class Network {
       BonjourCtor = mod.Bonjour ?? mod.default ?? mod;
     } catch {
       this.hooks.log?.(
-        "⚠️ mDNS 不可用：未安装 bonjour-service（无法自动发现同局域网 peer）。请在 pi-a2a 目录运行 npm install。",
+        "⚠️ mDNS unavailable: bonjour-service is not installed (cannot auto-discover LAN peers). Run npm install in the pi-a2a directory.",
       );
       return;
     }
@@ -805,21 +805,21 @@ export class Network {
           name: this.config.peerName,
           role: this.config.role ?? "",
           agent: this.config.agentId,
-          ws: this.config.workspace, // 明文，向后兼容（过渡期双发，后续废弃）
-          wsh: wsHash(this.config.workspace, this.config.workspaceSecret), // workspace hash，隔离靠它
+          ws: this.config.workspace, // plaintext, back-compat (dual-sent during transition; to be removed)
+          wsh: wsHash(this.config.workspace, this.config.workspaceSecret), // workspace hash; isolation relies on it
           proto: PROTO,
           a2aver: A2AVER,
         },
       });
       this.service?.on?.("error", (e: unknown) => {
-        this.hooks.log?.(`⚠️ mDNS 发布失败（服务名冲突？）: ${e instanceof Error ? e.message : String(e)}`);
+        this.hooks.log?.(`⚠️ mDNS publish failed (service name conflict?): ${e instanceof Error ? e.message : String(e)}`);
       });
       this.browser = this.bonjour.find({ type: SERVICE_TYPE });
       this.browser.on("up", (svc: any) => this.onPeerUp(svc));
       this.browser.on("down", (svc: any) => this.onPeerDown(svc));
-      this.hooks.log?.(`mDNS 广告 + 浏览已启动 (ws=${this.config.workspace}, proto=a2a, 实例=${instanceName})`);
+      this.hooks.log?.(`mDNS advertise + browse started (ws=${this.config.workspace}, proto=a2a, instance=${instanceName})`);
     } catch (e) {
-      this.hooks.log?.(`⚠️ mDNS 启动失败: ${e instanceof Error ? e.message : String(e)}`);
+      this.hooks.log?.(`⚠️ mDNS start failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -834,13 +834,13 @@ export class Network {
       if (this.isIpv4(a) && !addrs.includes(a)) addrs.push(a);
     }
     if (addrs.length === 0) return "";
-    // 优先选和本机同网段的地址（跨机可达），避免命中虚拟网卡（Docker/WSL 的 172.x 等）
+    // prefer an address on the same subnet as this host (reachable across machines); avoid virtual NICs (Docker/WSL 172.x, etc.)
     if (!this.lanIp.startsWith("127.")) {
       const prefix = this.lanIp.split(".").slice(0, 3).join(".") + ".";
       const same = addrs.find((a) => a.startsWith(prefix));
       if (same) return same;
     }
-    // 回退：跳过 link-local(169.254) 和 loopback(127)
+    // fallback: skip link-local (169.254) and loopback (127)
     return addrs.find((a) => !a.startsWith("169.254.") && !a.startsWith("127.")) ?? addrs[0];
   }
   private betterHost(prev: string | undefined, next: string): string {
@@ -851,9 +851,9 @@ export class Network {
 
   private onPeerUp(svc: any): void {
     const txt = svc?.txt ?? {};
-    if (!wsMatch(txt, this.config)) return; // 工作区隔离（优先 wsh hash，回退 ws 明文）
+    if (!wsMatch(txt, this.config)) return; // workspace isolation (prefer wsh hash, fall back to plaintext ws)
     if (txt.proto !== PROTO) {
-      // 硬切：非 A2A 协议（含旧 proto=1 或无 proto）一律忽略
+      // hard cut: ignore anything that is not the A2A protocol (including legacy proto=1 or missing proto)
       return;
     }
     const peerName = String(txt.name ?? svc?.name ?? "");
@@ -876,7 +876,7 @@ export class Network {
       lastSeen: Date.now(),
     });
     if (isNew) {
-      this.hooks.log?.(`peer 上线: ${peerName} (${host}:${port})`);
+      this.hooks.log?.(`peer online: ${peerName} (${host}:${port})`);
       this.hooks.onPeersChanged();
       void this.flushOutbox(peerName);
       void this.pullMemSnapshot(peerName);
@@ -888,21 +888,21 @@ export class Network {
   private onPeerDown(svc: any): void {
     const txt = svc?.txt ?? {};
     const peerName = String(txt.name ?? svc?.name ?? "");
-    // 不立即删除：mDNS "down" 在 WiFi / 多网卡 / 防火墙环境下频繁误报，
-    // 真正离线由 refresh() 的 TTL + healthCheck 兜底判定（网络不通才删）。
-    // 这样避免 mDNS 多播偶发丢包导致 peer 被误删且无法用 healthCheck 拉回。
+    // don't delete immediately: mDNS "down" frequently misfires on WiFi / multi-NIC / firewalled setups,
+    // real offline is decided by refresh()'s TTL + healthCheck fallback (delete only when the network is unreachable).
+    // this avoids a peer being wrongly deleted by sporadic multicast loss and then unrecoverable via healthCheck.
     if (this.peers.has(peerName)) {
-      this.hooks.log?.(`peer mDNS 信号丢失: ${peerName}（保留，转 healthCheck 兜底）`);
+      this.hooks.log?.(`peer mDNS signal lost: ${peerName} (kept; falling back to healthCheck)`);
     }
   }
 
-  // ── 同机 presence 兜底发现 ───────────────────────────
+  // ── same-host presence fallback discovery ───────────────
   private presenceDir(): string {
     return path.join(os.homedir(), ".pi", "agent", "pi-a2a-presence");
   }
   private presenceFile(): string {
-    // 文件名带 pid：同目录双进程（同 agentId）不再互相覆盖 presence 文件。
-    // scanPresence 按 agentId 去重、取最新 ts 的那条供发现，但不删较旧的 pid 文件（活进程还在写）。
+    // filenames carry the pid so two processes in one directory (same agentId) no longer overwrite each other's presence file.
+    // scanPresence dedups by agentId and uses the newest ts for discovery, without deleting older pid files (the live process is still writing).
     return path.join(this.presenceDir(), `${this.config.agentId}-${process.pid}.json`);
   }
   private writePresence(): void {
@@ -914,8 +914,8 @@ export class Network {
         peerName: this.config.peerName,
         agentId: this.config.agentId,
         role: this.config.role ?? "",
-        workspace: this.config.workspace, // 明文，向后兼容（过渡期双发，后续废弃）
-        wsh: wsHash(this.config.workspace, this.config.workspaceSecret), // workspace hash，隔离靠它
+        workspace: this.config.workspace, // plaintext, back-compat (dual-sent during transition; to be removed)
+        wsh: wsHash(this.config.workspace, this.config.workspaceSecret), // workspace hash; isolation relies on it
         host: "127.0.0.1",
         port: this.listenPort,
         proto: PROTO,
@@ -924,7 +924,7 @@ export class Network {
       };
       fs.writeFileSync(this.presenceFile(), JSON.stringify(rec));
     } catch {
-      /* 写失败不致命 */
+      /* a failed write is not fatal */
     }
   }
   private clearPresence(): void {
@@ -942,7 +942,7 @@ export class Network {
       return;
     }
     const now = Date.now();
-    // 阶段 1：读 + 过滤 + TTL 清理（删文件是副作用，留在 scanPresence；纯去重才用 dedupePresence）
+    // stage 1: read + filter + TTL cleanup (deleting files is a side effect that stays in scanPresence; use dedupePresence for pure dedup)
     const valid: PresenceRec[] = [];
     for (const f of files) {
       if (!f.endsWith(".json")) continue;
@@ -952,15 +952,15 @@ export class Network {
       } catch {
         continue;
       }
-      // workspace 隔离：优先 wsh hash，回退 ws 明文（兼容旧版本）
+      // workspace isolation: prefer wsh hash, fall back to plaintext ws (older-version compatibility)
       if (!rec || !wsMatch(rec, this.config)) continue;
-      if (rec.proto !== PROTO) continue; // 硬切：必须是 A2A 协议
+      if (rec.proto !== PROTO) continue; // hard cut: must be the A2A protocol
       const peerName = String(rec.peerName ?? "");
       if (!peerName || peerName === this.config.peerName) continue;
       const port = Number(rec.port);
       if (!Number.isFinite(port) || port <= 0) continue;
       const ts = typeof rec.ts === "number" ? rec.ts : 0;
-      // TTL 过期 → 进程已死，安全删除（这是唯一允许删文件的路径）
+      // TTL expired → the process is dead; safe to delete (this is the only path allowed to delete files)
       if (ts > 0 && now - ts > PRESENCE_TTL_MS) {
         try {
           fs.unlinkSync(path.join(this.presenceDir(), f));
@@ -971,9 +971,9 @@ export class Network {
       }
       valid.push(rec);
     }
-    // 阶段 2：同 agentId 多 pid 去重（取最新 ts）— 抽成 export dedupePresence，production/test 共用
+    // stage 2: dedup multiple pids for one agentId (take the newest ts) — extracted as the exported dedupePresence, shared by production/tests
     const deduped = dedupePresence(valid);
-    // 阶段 3：加入 peers
+    // stage 3: add to peers
     for (const rec of deduped) {
       const peerName = String(rec.peerName);
       const port = Number(rec.port);
@@ -988,14 +988,14 @@ export class Network {
         lastSeen: Date.now(),
       });
       if (isNew) {
-        this.hooks.log?.(`peer 上线(presence): ${peerName} (127.0.0.1:${port})`);
+        this.hooks.log?.(`peer online (presence): ${peerName} (127.0.0.1:${port})`);
         this.hooks.onPeersChanged();
         void this.flushOutbox(peerName);
       }
     }
   }
 
-  // ── 健康探测续命 ──────────────────────────────────────
+  // ── health-probe keep-alive ────────────────────────────
   private async healthCheck(peer: Peer): Promise<boolean> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), POST_TIMEOUT_MS);
@@ -1003,7 +1003,7 @@ export class Network {
       const r = await fetch(`http://${peer.host}:${peer.port}/health`, { signal: ctrl.signal });
       if (!r.ok) return false;
       const j = await r.json().catch(() => null);
-      // workspace 校验：优先 wsh hash，回退 ws 明文（兼容旧版本 peer）
+      // workspace check: prefer wsh hash, fall back to plaintext ws (older-peer compatibility)
       return !!j && wsMatch(j, this.config);
     } catch {
       return false;
@@ -1049,7 +1049,7 @@ export class Network {
     }
   }
 
-  // ── 离线 outbox 重投 ──────────────────────────────────
+  // ── offline outbox redelivery ──────────────────────────
   private async flushOutbox(peerName: string): Promise<void> {
     const entries = this.hooks.store.getOutboxFor(peerName);
     if (entries.length === 0) return;
@@ -1062,22 +1062,22 @@ export class Network {
       if (!this.isOnline(peerName)) break;
       if (await this.sendToOne(this.getPeer(peerName)!, msg)) {
         this.hooks.store.removeOutbox(e.id, peerName);
-        this.hooks.log?.(`重投成功: ${e.id} → ${peerName}`);
+        this.hooks.log?.(`redelivery succeeded: ${e.id} → ${peerName}`);
       }
     }
     this.hooks.store.persist();
   }
 
-  // ── 共享记忆 mem 同步 ─────────────────────────────────
+  // ── shared-memory (mem) sync ───────────────────────────
   /**
-   * 向 peer 拉一次 mem 全量 snapshot，LWW 合并到本地。每个 peer 每进程只拉一次
-   * （snapshottedPeers 防重）；重启后 Set 清空，重新拉，幂等。失败静默，下次重试。
+   * Pull a full mem snapshot from a peer once and LWW-merge it locally. Each peer is pulled once per process
+   * (snapshottedPeers prevents repeats); the Set clears on restart and re-pulls, which is idempotent. Failures are silent and retried.
    */
   private async pullMemSnapshot(peerName: string): Promise<void> {
     if (this.snapshottedPeers.has(peerName)) return;
     const peer = this.getPeer(peerName);
     if (!peer) return;
-    this.snapshottedPeers.add(peerName); // 先标记：即使失败也不重试同 peer，避免抖动网络下反复打
+    this.snapshottedPeers.add(peerName); // mark first: don't retry the same peer even on failure, avoiding hammering on a flaky network
     try {
       const resp = await this.rpcCall(peer, "MemSnapshot", {});
       const entries: any[] = resp?.result?.entries ?? [];
@@ -1089,29 +1089,29 @@ export class Network {
       }
       if (changed) {
         this.hooks.store.persist();
-        this.hooks.log?.(`mem snapshot 对齐: ${peerName} (${entries.length} 条)`);
+        this.hooks.log?.(`mem snapshot aligned: ${peerName} (${entries.length} entries)`);
       }
     } catch (e) {
-      this.snapshottedPeers.delete(peerName); // 失败则允许重试（refresh 会定期重拉，直到成功）
-      this.hooks.log?.(`mem snapshot 拉取失败: ${peerName} ${e instanceof Error ? e.message : String(e)}`);
+      this.snapshottedPeers.delete(peerName); // on failure allow retries (refresh re-pulls periodically until it succeeds)
+      this.hooks.log?.(`mem snapshot pull failed: ${peerName} ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
   /**
-   * 广播单个 mem entry 增量给所有在线 peer（best-effort，失败静默）。
-   * 离线 peer 不进 outbox——下次 onPeerUp 时 pullMemSnapshot 从对方对齐即可。
+   * Broadcast a single mem entry delta to all online peers (best-effort, silent on failure).
+   * Offline peers are not queued in the outbox — pullMemSnapshot realigns from them at the next onPeerUp.
    */
   broadcastMemUpdate(key: string, entry: MemEntry): void {
     const peers = this.getOnlinePeers().filter((p) => p.peerName !== this.config.peerName);
     for (const p of peers) {
       this.rpcCall(p, "MemUpdate", { key, entry }).catch(() => {
-        /* 单 peer 投递失败不影响其他 peer；对方上线后 snapshot 治愈 */
+        /* one peer's delivery failure doesn't affect others; the snapshot heals it when they come online */
       });
     }
   }
 
-  // ── 文件传输 ──────────────────────────────────────────
-  /** POST /file?path=<rel>&sha256=<hex>&overwrite=1  + 原始字节 body */
+  // ── file transfer ───────────────────────────────────────
+  /** POST /file?path=<rel>&sha256=<hex>&overwrite=1  + raw byte body */
   private async handleFileReceive(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     if (!this.checkAuth(req)) return this.json(res, 401, { error: "unauthorized" });
     const q = this.queryOf(req);
@@ -1126,7 +1126,7 @@ export class Network {
     }
     try {
       const got = writeReceivedFile(this.fileRoot(), rel, data, wantSha, overwrite);
-      this.hooks.log?.(`file 收到: ${got.rel} (${got.bytes} bytes)`);
+      this.hooks.log?.(`file received: ${got.rel} (${got.bytes} bytes)`);
       return this.json(res, 200, {
         ok: true,
         path: got.rel,
@@ -1139,7 +1139,7 @@ export class Network {
     }
   }
 
-  /** GET /file?path=<rel>  → 响应体 = 原始字节，头部带 sha256/字节数 */
+  /** GET /file?path=<rel>  → response body = raw bytes, headers carry sha256/byte count */
   private handleFileSend(req: http.IncomingMessage, res: http.ServerResponse): void {
     if (!this.checkAuth(req)) return this.json(res, 401, { error: "unauthorized" });
     const q = this.queryOf(req);
@@ -1153,7 +1153,7 @@ export class Network {
     if (out.bytes > this.fileMaxBytes()) {
       return this.json(res, 413, { error: `file exceeds fileMaxBytes (${out.bytes})` });
     }
-    this.hooks.log?.(`file 发出: ${out.rel} (${out.bytes} bytes)`);
+    this.hooks.log?.(`file sent: ${out.rel} (${out.bytes} bytes)`);
     res.writeHead(200, {
       "Content-Type": "application/octet-stream",
       "Content-Length": String(out.bytes),
@@ -1168,7 +1168,7 @@ export class Network {
     return u.searchParams;
   }
 
-  /** 读取原始 body（非 JSON），带上限。 */
+  /** Read the raw body (non-JSON) with a size cap. */
   private readRawBody(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
     return new Promise((resolve, reject) => {
       const len = parseInt(req.headers["content-length"] ?? "0", 10);
@@ -1190,7 +1190,7 @@ export class Network {
     });
   }
 
-  /** 客户端：把本地沙箱文件推送到 peer。 */
+  /** client: push a local sandbox file to a peer. */
   async putFile(
     peerName: string,
     localRel: string,
@@ -1220,7 +1220,7 @@ export class Network {
     return { path: j.path, bytes: j.bytes, sha256: j.sha256 };
   }
 
-  /** 客户端：从 peer 拉取文件到本地沙箱。 */
+  /** client: pull a file from a peer into the local sandbox. */
   async getFile(
     peerName: string,
     remoteRel: string,
@@ -1241,7 +1241,7 @@ export class Network {
     const shaHeader = resp.headers.get("x-a2a-file-sha256") ?? undefined;
     const buf = Buffer.from(await resp.arrayBuffer());
     const got = writeReceivedFile(this.fileRoot(), localRel, buf, shaHeader, overwrite);
-    this.hooks.log?.(`file 拉取: ${got.rel} (${got.bytes} bytes)`);
+    this.hooks.log?.(`file fetched: ${got.rel} (${got.bytes} bytes)`);
     return { path: got.rel, bytes: got.bytes, sha256: got.sha256 };
   }
 
