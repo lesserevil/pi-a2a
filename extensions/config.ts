@@ -1,28 +1,28 @@
 /**
- * pi-a2a — 配置读写（A2A / 局域网 P2P 版）
+ * pi-a2a — configuration read/write (A2A / LAN P2P edition)
  *
- * 配置形状:
+ * Config shape:
  *   {
- *     "workspace": "my-team",            // 工作区名，决定 mDNS ws 隔离
- *     "workspaceSecret": "shared-pass",   // 共享密钥（A2A Bearer 互验 + ws 校验）
- *     "agentId": "<auto>",               // 首次自动生成并持久化
+ *     "workspace": "my-team",            // workspace name; determines mDNS ws isolation
+ *     "workspaceSecret": "shared-pass",   // shared secret (A2A Bearer auth + ws check)
+ *     "agentId": "<auto>",               // generated and persisted automatically on first use
  *     "peerName": "backend",
  *     "role": "writes the API",
- *     "listenPort": 0,                   // 可选，0 = OS 分配
- *     "advertiseHost": "192.168.1.50",   // 可选，手动指定对外广告 host（多网卡/Docker/WSL 自动检测错误时用）
- *     "mdnsInterface": "192.168.1.50",    // 可选，把 mDNS 组播绑定到指定网卡（多网卡默认路由走错时用；同网段多地址的主机不要设置）
- *     // ── A2A 端点/时序（均可选，有默认）─────────────
+ *     "listenPort": 0,                   // optional; 0 = OS-assigned
+ *     "advertiseHost": "192.168.1.50",   // optional; manually set the advertised host (use when auto-detection picks the wrong NIC under multi-NIC/Docker/WSL)
+ *     "mdnsInterface": "192.168.1.50",    // optional; bind mDNS multicast to a specific NIC (when the multi-NIC default route is wrong; do NOT set on hosts with multiple addresses on the same subnet)
+ *     // ── A2A endpoints / timings (all optional, defaults apply) ──
  *     "agentCardPath": "/.well-known/agent-card.json",
- *     "rpcPath": "/rpc",                  // JSON-RPC 单端点
- *     "notifyPath": "/a2a/notify",         // push-notification webhook 接收
- *     "pushSweepMs": 15000,               // push 兜底扫描间隔
- *     "pushBackstopMs": 30000,            // 超过此时长未收 push 则主动 GetTask
- *     "autoInjectMessage": false         // 普通消息是否也自动注入会话（默认 false=只通知）
- *     "fileRoot": "~/.pi/a2a-files",    // 可选，文件传输沙箱根目录（a2a_put/get 只能读写其下）
- *     "fileMaxBytes": 67108864            // 可选，单次文件传输上限（默认 64 MiB）
+ *     "rpcPath": "/rpc",                  // JSON-RPC single endpoint
+ *     "notifyPath": "/a2a/notify",         // push-notification webhook receiver
+ *     "pushSweepMs": 15000,               // push fallback sweep interval
+ *     "pushBackstopMs": 30000,            // if no push arrives within this window, actively call GetTask
+ *     "autoInjectMessage": false         // whether plain messages are also auto-injected (default false = notify only)
+ *     "fileRoot": "~/.pi/a2a-files",    // optional; sandbox root for file transfer (a2a_put/get can only read/write under it)
+ *     "fileMaxBytes": 67108864            // optional; per-transfer size limit (default 64 MiB)
  *   }
  *
- * 配置优先级：项目级 (.pi/pi-a2a.json) > 全局 (~/.pi/agent/pi-a2a.json)
+ * Config precedence: project-level (.pi/pi-a2a.json) > global (~/.pi/agent/pi-a2a.json)
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -30,50 +30,50 @@ import * as os from "node:os";
 import * as crypto from "node:crypto";
 
 export interface A2aConfig {
-  workspace: string; // 工作区名，决定 mDNS ws 隔离
-  workspaceSecret: string; // 共享密钥（A2A Bearer 鉴权 + ws 校验）
-  agentId: string; // 首次自动生成并持久化
+  workspace: string; // workspace name; determines mDNS ws isolation
+  workspaceSecret: string; // shared secret (A2A Bearer auth + ws check)
+  agentId: string; // generated and persisted automatically on first use
   peerName: string;
   role?: string;
-  listenPort?: number; // 可选，0 = OS 分配（默认 0）
-  advertiseHost?: string; // 可选，手动指定对外广告 host（agent card / push webhook URL 用）；多网卡/Docker/WSL 环境自动检测到虚拟网卡时用此项覆盖
-  mdnsInterface?: string; // 可选，将 mDNS/组播 socket 绑定到此网卡地址。仅当本机默认组播出口走错网卡时设置（例如 Windows + Tailscale）。同一局域网内拥有多个地址的多网卡主机请勿设置，否则会收不到 peer 的公告。
-  // ── A2A 端点/时序（均可选）──────────────────────────
-  agentCardPath?: string; // 默认 /.well-known/agent-card.json
-  rpcPath?: string; // 默认 /rpc（JSON-RPC 单端点）
-  notifyPath?: string; // 默认 /a2a/notify（push webhook 接收）
-  pushSweepMs?: number; // 默认 15000
-  pushBackstopMs?: number; // 默认 30000
-  autoInjectMessage?: boolean; // 默认 false：普通 message 只通知；true 时也注入会话
-  fileRoot?: string; // 可选，文件传输的沙箱根目录（默认 ~/.pi/a2a-files）；a2a_put/get 只能读写其下
-  fileMaxBytes?: number; // 可选，单次传输上限（默认 64 MiB）
+  listenPort?: number; // optional; 0 = OS-assigned (default 0)
+  advertiseHost?: string; // optional; manually set the advertised host (used in the agent card / push webhook URL); override when auto-detection finds a virtual NIC under multi-NIC/Docker/WSL
+  mdnsInterface?: string; // optional; bind the mDNS/multicast socket to this NIC address. Only set when the host's default multicast egress uses the wrong NIC (e.g. Windows + Tailscale). Do NOT set on multi-NIC hosts with several addresses on the same LAN, or peer announcements will not be received.
+  // ── A2A endpoints / timings (all optional) ──────────
+  agentCardPath?: string; // default /.well-known/agent-card.json
+  rpcPath?: string; // default /rpc (JSON-RPC single endpoint)
+  notifyPath?: string; // default /a2a/notify (push webhook receiver)
+  pushSweepMs?: number; // default 15000
+  pushBackstopMs?: number; // default 30000
+  autoInjectMessage?: boolean; // default false: plain messages notify only; when true they are also injected into the session
+  fileRoot?: string; // optional; sandbox root for file transfer (default ~/.pi/a2a-files); a2a_put/get can only read/write under it
+  fileMaxBytes?: number; // optional; per-transfer size limit (default 64 MiB)
 }
 
-// 占位符：表示 agentId 尚未真正生成（如 config.example.json 里的空串）
+// Placeholder: indicates agentId has not really been generated yet (e.g. the empty string in config.example.json)
 const AGENTID_PLACEHOLDERS = new Set(["", "auto-generated-on-first-use", "auto-generated"]);
 
 /**
- * 配置/数据库都绑定到项目级 .pi/ 目录。
- * 设计：不做全局 fallback。这样不同目录各自有独立配置（独立 agentId），
- * 不同项目即使 peerName 重名（都叫 FE）也能通过 workspace + secret 经全局
- * presence 目录（~/.pi/agent/pi-a2a-presence/）互相发现并通信，
- * 而不会因共用全局配置导致 agentId 混淆/双实例。
+ * Both config and database are scoped to the project-level .pi/ directory.
+ * Design: no global fallback. This way each directory keeps its own config (its own agentId),
+ * so even if different projects reuse a peerName (both called FE) they can still find each other via workspace + secret through the global
+ * presence directory (~/.pi/agent/pi-a2a-presence/) and communicate,
+ * without a shared global config causing agentId confusion / double instances.
  */
 export function configPath(cwd: string): string {
   return path.join(cwd, ".pi", "pi-a2a.json");
 }
 
-/** 本地数据库（JSON 文件）路径：与 config 同目录。 */
+/** Local database (JSON file) path: same directory as config. */
 export function dbPathFor(cwd: string): string {
   return path.join(cwd, ".pi", "pi-a2a.db.json");
 }
 
-/** 展开 $VAR / ${VAR} 形式的环境变量引用。 */
+/** Expand $VAR / ${VAR} environment variable references. */
 export function expandEnv(s: string): string {
   return s.replace(/\$\{?([A-Z_][A-Z0-9_]*)\}?/g, (_, v) => process.env[v] ?? `$${v}`);
 }
 
-/** 生成稳定的 agentId（16 位 hex）。 */
+/** Generate a stable agentId (16 hex chars). */
 export function genAgentId(): string {
   return crypto
     .createHash("sha256")
@@ -89,13 +89,13 @@ export interface LoadedConfig {
   path: string;
 }
 
-/** 读取项目级配置（<cwd>/.pi/pi-a2a.json）。首次使用时自动补全 agentId 并回写。 */
+/** Read the project-level config (<cwd>/.pi/pi-a2a.json). Fills in and writes back agentId on first use. */
 export function loadConfig(cwd: string): LoadedConfig | null {
   const p = configPath(cwd);
   if (!fs.existsSync(p)) return null;
   try {
     const raw = JSON.parse(fs.readFileSync(p, "utf8"));
-    // 新形状校验：必须有 workspace + workspaceSecret + peerName
+    // new-shape validation: requires workspace + workspaceSecret + peerName
     if (raw && raw.workspace && raw.workspaceSecret && raw.peerName) {
       raw.workspace = expandEnv(String(raw.workspace));
       raw.workspaceSecret = expandEnv(String(raw.workspaceSecret));
@@ -104,18 +104,18 @@ export function loadConfig(cwd: string): LoadedConfig | null {
         try {
           fs.writeFileSync(p, JSON.stringify(raw, null, 2) + "\n");
         } catch {
-          /* 写失败则用内存 id，本会话仍可用 */
+          /* if the write fails, fall back to an in-memory id; still usable this session */
         }
       }
       return { config: raw as A2aConfig, path: p };
     }
   } catch {
-    /* 忽略损坏文件 */
+    /* ignore a corrupt file */
   }
   return null;
 }
 
-/** 保存配置到项目级 .pi/ 目录。返回文件路径。 */
+/** Save config to the project-level .pi/ directory. Returns the file path. */
 export function saveConfig(cwd: string, config: A2aConfig): string {
   const dir = path.join(cwd, ".pi");
   fs.mkdirSync(dir, { recursive: true });
